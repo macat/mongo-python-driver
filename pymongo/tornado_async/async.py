@@ -1,0 +1,211 @@
+# Copyright 2009-2010 10gen, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tornado asynchronous Python driver for MongoDB."""
+
+from tornado.ioloop import IOLoop
+import greenlet
+import socket
+import struct
+import pymongo
+from pymongo import ASCENDING, DESCENDING, GEO2D
+from pymongo.errors import ConnectionFailure
+
+class Connection(pymongo.Connection):
+    def __init__(self, *args, **kwargs):
+        self.greenlets = {}
+        super(Connection, self).__init__(*args, **kwargs)
+#        self.callbacks = {} # map: request_id-> greenlet
+
+    def __getattr__(self, name):
+        """Get a database by name.
+
+        Raises :class:`~pymongo.errors.InvalidName` if an invalid
+        database name is used.
+
+        :Parameters:
+          - `name`: the name of the database to get
+        """
+        return Database(self, name)
+
+    def _is_async(self):
+        return greenlet.getcurrent() in self.greenlets
+
+    def connect(self, host, port):
+        if self._is_async():
+            self.usage_count = 0 # TODO: asyncmongo does this; what's this for?
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+
+                # TODO: what if this would block?
+                s.connect((host, port))
+
+                # Code borrowed from asyncmongo
+                # Tornado's IOStream makes the socket non-blocking
+                self.__stream = tornado.iostream.IOStream(s)
+                self.__stream.set_close_callback(self._socket_close)
+                self.__alive = True
+            except socket.error, error:
+                raise ConnectionFailure(error)
+
+            if self.__dbuser and self.__dbpass:
+                self.__authenticate = True
+        else:
+            # Synchronous call: regular pymongo processing
+            return super(Connection, self).connect(host, port)
+
+    def _socket_close(self):
+        """async cleanup after the socket is closed by the other end"""
+        # Code borrowed from asyncmongo
+        if self.__callback:
+            # TODO: is connectionfailure right, here?
+            self.__callback(None, ConnectionFailure('connection closed'))
+        self.__callback = None
+        self.__alive = False
+        self.__pool.cache(self)
+
+    def _send_message(self, message, with_last_error=False):
+        if self._is_async():
+            self._async_send_message(message)
+            # Resume calling greenlet
+            return greenlet.getcurrent().parent.switch()
+        else:
+            return super(Connection, self)._send_message(message, with_last_error)
+
+    def _receive_data_on_socket(self, length, sock, request_id):
+        if self._is_async():
+            def callback(data):
+                self.greenlets[request_id].switch(data)
+            self.__stream.read_bytes(length, callback=callback)
+            greenlet.getcurrent().parent.switch()
+        else:
+            return super(Connection, self)._receive_data_on_socket(length, sock, request_id)
+
+    def __repr__(self):
+        return 'Async' + super(Connection, self).__repr__()
+
+class Database(pymongo.database.Database):
+    def __getattr__(self, collection_name):
+        """
+        Return an async Collection instead of a pymongo Collection
+        """
+        return Collection(self, collection_name)
+
+class Collection(pymongo.collection.Collection):
+    def __getattribute__(self, operation_name):
+        """
+        Override pymongo Collection's attributes to replace the basic CRUD
+        operations with async alternatives.
+        # TODO: Note why this is __getattribute__
+        # TODO: Just override them explicitly?
+        @param operation_name:  Like 'find', 'remove', 'update', ...
+        @return:                A proxy method that will implement the operation
+                                asynchronously if provided a callback
+        """
+        if operation_name not in ('remove', 'update', 'insert', 'save', ):#'find'):
+            return super(Collection, self).__getattribute__(operation_name)
+        else:
+            def method(*args, **kwargs):
+                # Get pymongo's synchronous method for this operation
+                sync_method = getattr(self, operation_name)
+
+                # TODO: support non-kw callback arg
+                client_callback = kwargs.get('callback', None)
+                if not client_callback:
+                    # Synchronous call, normal pymongo processing
+                    return sync_method
+                else:
+                    # Async call
+                    del kwargs['callback']
+
+                    def call_method():
+                        self.connection.greenlets.add(
+                            greenlet.getcurrent()
+                        )
+
+                        result, error = None, None
+                        try:
+                            result = sync_method(*args, **kwargs)
+                        except Exception, e:
+                            error = e
+                        return result, error
+
+                    gr = greenlet.greenlet(call_method)
+                    print 'starting greenlet for %s: %s' % (
+                        operation_name, gr
+                    )
+
+                    # Start running the operation
+                    result, error = gr.switch()
+
+                    # The operation has completed & we're back on the main greenlet
+                    client_callback(result, error)
+
+            return method
+    def find(self, *args, **kwargs):
+        """
+        Return an async Cursor, not a pymongo Cursor
+        """
+        # TODO: support non-kw callback arg
+        client_callback = kwargs.get('callback', None)
+        if not client_callback:
+            # Synchronous call, normal pymongo processing
+            return super(Collection, self).find(*args, **kwargs)
+        else:
+            # Async call
+            del kwargs['callback']
+
+            # Code borrowed from pymongo Collection.find()
+            if not 'slave_okay' in kwargs:
+                kwargs['slave_okay'] = self.slave_okay
+            if not 'read_preference' in kwargs:
+                kwargs['read_preference'] = self.read_preference
+
+            def create_cursor():
+                self.database.connection.greenlets.add(
+                    greenlet.getcurrent()
+                )
+
+                result, error = None, None
+                try:
+                    result = sync_method(*args, **kwargs)
+                except Exception, e:
+                    error = e
+                return result, error
+
+            gr = greenlet.greenlet(create_cursor)
+
+            # Start running the operation
+            result, error = gr.switch()
+
+            # The operation has completed & we're back on the main greenlet
+            client_callback(result, error)
+
+if __name__ == '__main__':
+    cx = Connection()
+    db = cx.test
+    coll = db.test_collection
+
+    cursor = coll.find({})
+    sync_result = list(cursor)
+    print 'sync_result', sync_result
+
+    def callback(result, error):
+        print 'result', result
+        print 'error', error
+        IOLoop.instance().stop()
+
+    assert None == coll.find({}, callback=callback)
+    IOLoop.instance().start()
+

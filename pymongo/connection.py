@@ -601,6 +601,8 @@ class Connection(common.BaseObject):
                 if node:
                     return node
             except Exception, why:
+                import logging
+                logging.exception(why)
                 errors.append(str(why))
         # Try any hosts we discovered that were not in the seed list.
         for candidate in self.__nodes - seeds:
@@ -788,7 +790,7 @@ class Connection(common.BaseObject):
             self.disconnect()
             raise AutoReconnect(str(e))
 
-    def __receive_data_on_socket(self, length, sock):
+    def _receive_data_on_socket(self, length, sock, request_id):
         """Lowest level receive operation.
 
         Takes length to receive and repeatedly calls recv until able to
@@ -813,14 +815,14 @@ class Connection(common.BaseObject):
 
         Returns the response data with the header removed.
         """
-        header = self.__receive_data_on_socket(16, sock)
+        header = self._receive_data_on_socket(16, sock, request_id)
         length = struct.unpack("<i", header[:4])[0]
         assert request_id == struct.unpack("<i", header[8:12])[0], \
             "ids don't match %r %r" % (request_id,
                                        struct.unpack("<i", header[8:12])[0])
         assert operation == struct.unpack("<i", header[12:])[0]
 
-        return self.__receive_data_on_socket(length - 16, sock)
+        return self._receive_data_on_socket(length - 16, sock, request_id)
 
     def __send_and_receive(self, message, sock):
         """Send a message on the given socket and return the response data.
