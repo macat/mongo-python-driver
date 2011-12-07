@@ -14,7 +14,7 @@
 
 """Tornado asynchronous Python driver for MongoDB."""
 
-from tornado.ioloop import IOLoop
+import tornado.ioloop, tornado.iostream
 import greenlet
 import socket
 import struct
@@ -24,9 +24,12 @@ from pymongo.errors import ConnectionFailure
 
 class Connection(pymongo.Connection):
     def __init__(self, *args, **kwargs):
-        self.greenlets = {}
+#        self.greenlets = {}
+        # TODO: some way to resume the right greenlet when we get data in
+        # _receive_data_on_socket()
+        self.greenlets = set()
+        self.__stream = None
         super(Connection, self).__init__(*args, **kwargs)
-#        self.callbacks = {} # map: request_id-> greenlet
 
     def __getattr__(self, name):
         """Get a database by name.
@@ -43,6 +46,7 @@ class Connection(pymongo.Connection):
         return greenlet.getcurrent() in self.greenlets
 
     def connect(self, host, port):
+        print 'connect(), is_async =', self._is_async()
         if self._is_async():
             self.usage_count = 0 # TODO: asyncmongo does this; what's this for?
             try:
@@ -67,13 +71,8 @@ class Connection(pymongo.Connection):
 
     def _socket_close(self):
         """async cleanup after the socket is closed by the other end"""
-        # Code borrowed from asyncmongo
-        if self.__callback:
-            # TODO: is connectionfailure right, here?
-            self.__callback(None, ConnectionFailure('connection closed'))
-        self.__callback = None
-        self.__alive = False
-        self.__pool.cache(self)
+        # TODO: something?
+        print 'socket closed', self
 
     def _send_message(self, message, with_last_error=False):
         if self._is_async():
@@ -86,9 +85,19 @@ class Connection(pymongo.Connection):
     def _receive_data_on_socket(self, length, sock, request_id):
         if self._is_async():
             def callback(data):
-                self.greenlets[request_id].switch(data)
+                # TODO: get the *right* greenlet!!
+                list(self.greenlets)[0].switch(data, None)
+
+            # TODO HACK: is this as good as it gets?
+            if not self.__stream:
+                self.__stream = tornado.iostream.IOStream(sock)
+                self.__stream.set_close_callback(self._socket_close)
+                self.__alive = True
             self.__stream.read_bytes(length, callback=callback)
-            greenlet.getcurrent().parent.switch()
+            data, error = greenlet.getcurrent().parent.switch()
+            if error:
+                raise error
+            return data
         else:
             return super(Connection, self)._receive_data_on_socket(length, sock, request_id)
 
@@ -155,7 +164,7 @@ class Collection(pymongo.collection.Collection):
             return method
     def find(self, *args, **kwargs):
         """
-        Return an async Cursor, not a pymongo Cursor
+        Return an async Cursor, not a pymongo Cursor, if callback is provided
         """
         # TODO: support non-kw callback arg
         client_callback = kwargs.get('callback', None)
@@ -179,20 +188,23 @@ class Collection(pymongo.collection.Collection):
 
                 result, error = None, None
                 try:
-                    result = sync_method(*args, **kwargs)
+                    # TODO: get_more(), tailable cursors
+                    cursor = super(Collection, self).find(*args, **kwargs)
+                    result = list(cursor)
                 except Exception, e:
                     error = e
-                return result, error
+                client_callback(result, error)
 
             gr = greenlet.greenlet(create_cursor)
 
-            # Start running the operation
-            result, error = gr.switch()
+            # Start running find() in the greenlet
+            gr.switch()
 
             # The operation has completed & we're back on the main greenlet
-            client_callback(result, error)
+#            client_callback(result, error)
 
 if __name__ == '__main__':
+    print 'main greenlet:', greenlet.getcurrent()
     cx = Connection()
     db = cx.test
     coll = db.test_collection
@@ -202,10 +214,10 @@ if __name__ == '__main__':
     print 'sync_result', sync_result
 
     def callback(result, error):
-        print 'result', result
+        print 'async_result', result
         print 'error', error
-        IOLoop.instance().stop()
+        tornado.ioloop.IOLoop.instance().stop()
 
     assert None == coll.find({}, callback=callback)
-    IOLoop.instance().start()
+    tornado.ioloop.IOLoop.instance().start()
 
