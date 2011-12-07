@@ -17,9 +17,8 @@
 import tornado.ioloop, tornado.iostream
 import greenlet
 import socket
-import struct
+import unittest
 import pymongo
-from pymongo import ASCENDING, DESCENDING, GEO2D
 from pymongo.errors import ConnectionFailure
 
 class Connection(pymongo.Connection):
@@ -164,7 +163,8 @@ class Collection(pymongo.collection.Collection):
             return method
     def find(self, *args, **kwargs):
         """
-        Return an async Cursor, not a pymongo Cursor, if callback is provided
+        Run an async find(), rather than returning a pymongo Cursor, if callback
+        is provided.
         """
         # TODO: support non-kw callback arg
         client_callback = kwargs.get('callback', None)
@@ -200,24 +200,77 @@ class Collection(pymongo.collection.Collection):
             # Start running find() in the greenlet
             gr.switch()
 
-            # The operation has completed & we're back on the main greenlet
-#            client_callback(result, error)
+class AsyncTest(unittest.TestCase):
+    def setUp(self):
+        self.sync_cx = pymongo.Connection()
+        self.sync_db = self.sync_cx.test
+        self.sync_coll = self.sync_db.test_collection
+        self.sync_coll.remove()
+        self.sync_coll.insert([{'_id': i} for i in range(1000)], safe=True)
+
+    def test_repr(self):
+        cx = Connection()
+        self.assert_(repr(cx).startswith('Async'))
+
+    def mongoFindLambda(self, fn):
+        """
+        @param fn:          A function that executes a find() and takes a
+                            callback function.
+        @return:            result, error
+        """
+        result = {}
+        def callback(data, error):
+            print 'data =', data
+            result['data'] = data
+            result['error'] = error
+            tornado.ioloop.IOLoop.instance().stop()
+
+        fn(callback)
+        tornado.ioloop.IOLoop.instance().start()
+        return result['data'], result['error']
+
+    def assertMongoFoundLambda(self, fn, expected):
+        """
+        Test an async find() command.
+        @param fn:          A function that executes a find() and takes a
+                            callback function.
+        @param expected:    Expected list of values returned
+        """
+        result, error = self.mongoFindLambda(fn)
+        self.assertEqual(None, error)
+        self.assertEqual(expected, result)
+
+    def assertMongoFound(self, query, fields, expected):
+        """
+        Test an async find() command.
+        @param query:       Query, like {'i': {'$gt': 1}}
+        @param fields:      Field selector, like {'_id':false}
+        @param expected:    Expected list of values returned
+        """
+        self.assertMongoFoundLambda(
+            lambda cb: Connection().test.test_collection.find(
+                query,
+                fields,
+                callback=cb
+            ),
+            expected
+        )
+
+    def test_find(self):
+        # You know what's weird? MongoDB's default first batch is weird. It's
+        # 101 records or 4MB, whichever comes first.
+        self.assertMongoFound({'_id': 1}, {}, [{'_id': 1}])
+
+    def test_find_default_batch(self):
+        fn = lambda cb: Connection().test.test_collection.find(
+            callback=cb,
+            sort=[('_id', pymongo.ASCENDING)]
+        )
+
+        # You know what's weird? MongoDB's default first batch is weird. It's
+        # 101 records or 4MB, whichever comes first.
+        # TODO: why does this return all 1000 results, not 102?!
+        self.assertMongoFoundLambda(fn, [{'_id': i} for i in range(102)])
 
 if __name__ == '__main__':
-    print 'main greenlet:', greenlet.getcurrent()
-    cx = Connection()
-    db = cx.test
-    coll = db.test_collection
-
-    cursor = coll.find({})
-    sync_result = list(cursor)
-    print 'sync_result', sync_result
-
-    def callback(result, error):
-        print 'async_result', result
-        print 'error', error
-        tornado.ioloop.IOLoop.instance().stop()
-
-    assert None == coll.find({}, callback=callback)
-    tornado.ioloop.IOLoop.instance().start()
-
+    unittest.main()
