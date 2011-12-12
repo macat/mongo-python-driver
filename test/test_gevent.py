@@ -112,7 +112,7 @@ class GreenletTest(unittest.TestCase):
         results = {
             'find_fast_result': None,
             'find_slow_result': None,
-            }
+        }
 
         history = []
 
