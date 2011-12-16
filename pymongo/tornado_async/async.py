@@ -21,14 +21,14 @@ import unittest
 import pymongo
 from pymongo.errors import ConnectionFailure
 
-class Connection(pymongo.Connection):
+class AsyncConnection(pymongo.Connection):
     def __init__(self, *args, **kwargs):
 #        self.greenlets = {}
         # TODO: some way to resume the right greenlet when we get data in
         # _receive_data_on_socket()
         self.greenlets = set()
         self.__stream = None
-        super(Connection, self).__init__(*args, **kwargs)
+        super(AsyncConnection, self).__init__(*args, **kwargs)
 
     def __getattr__(self, name):
         """Get a database by name.
@@ -39,7 +39,7 @@ class Connection(pymongo.Connection):
         :Parameters:
           - `name`: the name of the database to get
         """
-        return Database(self, name)
+        return AsyncDatabase(self, name)
 
     def _is_async(self):
         return greenlet.getcurrent() in self.greenlets
@@ -66,7 +66,7 @@ class Connection(pymongo.Connection):
                 self.__authenticate = True
         else:
             # Synchronous call: regular pymongo processing
-            return super(Connection, self).connect(host, port)
+            return super(AsyncConnection, self).connect(host, port)
 
     def _socket_close(self):
         """async cleanup after the socket is closed by the other end"""
@@ -76,10 +76,10 @@ class Connection(pymongo.Connection):
     def _send_message(self, message, with_last_error=False):
         if self._is_async():
             self._async_send_message(message)
-            # Resume calling greenlet
+            # Resume calling greenlet (probably the main greenlet)
             return greenlet.getcurrent().parent.switch()
         else:
-            return super(Connection, self)._send_message(message, with_last_error)
+            return super(AsyncConnection, self)._send_message(message, with_last_error)
 
     def _receive_data_on_socket(self, length, sock, request_id):
         if self._is_async():
@@ -98,19 +98,22 @@ class Connection(pymongo.Connection):
                 raise error
             return data
         else:
-            return super(Connection, self)._receive_data_on_socket(length, sock, request_id)
+            return super(AsyncConnection, self)._receive_data_on_socket(length, sock, request_id)
 
     def __repr__(self):
-        return 'Async' + super(Connection, self).__repr__()
+        return 'Async' + super(AsyncConnection, self).__repr__()
 
-class Database(pymongo.database.Database):
+class AsyncDatabase(pymongo.database.Database):
     def __getattr__(self, collection_name):
         """
         Return an async Collection instead of a pymongo Collection
         """
-        return Collection(self, collection_name)
+        return AsyncCollection(self, collection_name)
 
-class Collection(pymongo.collection.Collection):
+    def __repr__(self):
+        return 'Async' + super(AsyncDatabase, self).__repr__()
+
+class AsyncCollection(pymongo.collection.Collection):
     def __getattribute__(self, operation_name):
         """
         Override pymongo Collection's attributes to replace the basic CRUD
@@ -122,7 +125,7 @@ class Collection(pymongo.collection.Collection):
                                 asynchronously if provided a callback
         """
         if operation_name not in ('remove', 'update', 'insert', 'save', ):#'find'):
-            return super(Collection, self).__getattribute__(operation_name)
+            return super(AsyncCollection, self).__getattribute__(operation_name)
         else:
             def method(*args, **kwargs):
                 # Get pymongo's synchronous method for this operation
@@ -158,9 +161,11 @@ class Collection(pymongo.collection.Collection):
                     result, error = gr.switch()
 
                     # The operation has completed & we're back on the main greenlet
+                    assert not greenlet.getcurrent().parent
                     client_callback(result, error)
 
             return method
+
     def find(self, *args, **kwargs):
         """
         Run an async find(), rather than returning a pymongo Cursor, if callback
@@ -170,7 +175,7 @@ class Collection(pymongo.collection.Collection):
         client_callback = kwargs.get('callback', None)
         if not client_callback:
             # Synchronous call, normal pymongo processing
-            return super(Collection, self).find(*args, **kwargs)
+            return super(AsyncCollection, self).find(*args, **kwargs)
         else:
             # Async call
             del kwargs['callback']
@@ -189,7 +194,7 @@ class Collection(pymongo.collection.Collection):
                 result, error = None, None
                 try:
                     # TODO: get_more(), tailable cursors
-                    cursor = super(Collection, self).find(*args, **kwargs)
+                    cursor = super(AsyncCollection, self).find(*args, **kwargs)
                     result = list(cursor)
                 except Exception, e:
                     error = e
@@ -200,17 +205,26 @@ class Collection(pymongo.collection.Collection):
             # Start running find() in the greenlet
             gr.switch()
 
+    def __repr__(self):
+        return 'Async' + super(AsyncCollection, self).__repr__()
+
+
 class AsyncTest(unittest.TestCase):
     def setUp(self):
         self.sync_cx = pymongo.Connection()
         self.sync_db = self.sync_cx.test
         self.sync_coll = self.sync_db.test_collection
         self.sync_coll.remove()
+        self.sync_coll.ensure_index([('_id', pymongo.ASCENDING)])
         self.sync_coll.insert([{'_id': i} for i in range(1000)], safe=True)
 
     def test_repr(self):
-        cx = Connection()
+        cx = AsyncConnection()
         self.assert_(repr(cx).startswith('Async'))
+        db = cx.test
+        self.assert_(repr(db).startswith('Async'))
+        coll = db.test
+        self.assert_(repr(coll).startswith('Async'))
 
     def mongoFindLambda(self, fn):
         """
@@ -220,7 +234,7 @@ class AsyncTest(unittest.TestCase):
         """
         result = {}
         def callback(data, error):
-            print 'data =', data
+#            print 'data =', data
             result['data'] = data
             result['error'] = error
             tornado.ioloop.IOLoop.instance().stop()
@@ -248,7 +262,7 @@ class AsyncTest(unittest.TestCase):
         @param expected:    Expected list of values returned
         """
         self.assertMongoFoundLambda(
-            lambda cb: Connection().test.test_collection.find(
+            lambda cb: AsyncConnection().test.test_collection.find(
                 query,
                 fields,
                 callback=cb
@@ -262,7 +276,7 @@ class AsyncTest(unittest.TestCase):
         self.assertMongoFound({'_id': 1}, {}, [{'_id': 1}])
 
     def test_find_default_batch(self):
-        fn = lambda cb: Connection().test.test_collection.find(
+        fn = lambda cb: AsyncConnection().test.test_collection.find(
             callback=cb,
             sort=[('_id', pymongo.ASCENDING)]
         )
