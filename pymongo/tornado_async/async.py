@@ -283,7 +283,6 @@ class AsyncTest(
         self.sync_db = self.sync_cx.test
         self.sync_coll = self.sync_db.test_collection
         self.sync_coll.remove()
-        self.sync_coll.ensure_index([('_id', pymongo.ASCENDING)])
         self.sync_coll.insert([{'_id': i} for i in range(1000)], safe=True)
 
     def test_repr(self):
@@ -342,6 +341,34 @@ class AsyncTest(
         self.assertEventuallyEqual(
             [{'_id': i} for i in range(101, 1000)],
             lambda: len(results) >= 2 and results[1]
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
+
+    def test_batch_size(self):
+        results = []
+        cursor = None
+
+        def callback(result, error):
+            self.assert_(error is None)
+            results.append(result)
+            if cursor.alive:
+                cursor.get_more(callback=callback)
+
+        cursor = AsyncConnection().test.test_collection.find(
+            sort=[('_id', pymongo.ASCENDING)],
+            callback=callback,
+            batch_size=10
+        )
+
+        expected_results = [
+            [{'_id': i} for i in range(start_batch, start_batch + 10)]
+            for start_batch in range(0, 1000, 10)
+        ]
+
+        self.assertEventuallyEqual(
+            expected_results,
+            lambda: results
         )
 
         tornado.ioloop.IOLoop.instance().start()
