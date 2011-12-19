@@ -1,4 +1,4 @@
-# Copyright 2009-2010 10gen, Inc.
+# Copyright 2011 10gen, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,19 +14,22 @@
 
 """Tornado asynchronous Python driver for MongoDB."""
 
+import socket
+import sys
+import unittest
+
 import tornado.ioloop, tornado.iostream
 import greenlet
-import socket
-import unittest
+
 import pymongo
 from pymongo.errors import ConnectionFailure
 
+# Tornado testing tools
+from pymongo.tornado_async import eventually, puritanical
+
 class AsyncConnection(pymongo.Connection):
     def __init__(self, *args, **kwargs):
-#        self.greenlets = {}
-        # TODO: some way to resume the right greenlet when we get data in
-        # _receive_data_on_socket()
-        self.greenlets = set()
+        self.greenlet = None
         self.__stream = None
         super(AsyncConnection, self).__init__(*args, **kwargs)
 
@@ -42,23 +45,22 @@ class AsyncConnection(pymongo.Connection):
         return AsyncDatabase(self, name)
 
     def _is_async(self):
-        return greenlet.getcurrent() in self.greenlets
+        return greenlet.getcurrent() == self.greenlet
 
     def connect(self, host, port):
-        print 'connect(), is_async =', self._is_async()
+        print >> sys.stderr, 'connect(), is_async =', self._is_async()
         if self._is_async():
             self.usage_count = 0 # TODO: asyncmongo does this; what's this for?
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
 
                 # TODO: what if this would block?
-                s.connect((host, port))
+                sock.connect((host, port))
 
                 # Code borrowed from asyncmongo
                 # Tornado's IOStream makes the socket non-blocking
-                self.__stream = tornado.iostream.IOStream(s)
+                self.__stream = tornado.iostream.IOStream(sock)
                 self.__stream.set_close_callback(self._socket_close)
-                self.__alive = True
             except socket.error, error:
                 raise ConnectionFailure(error)
 
@@ -73,32 +75,35 @@ class AsyncConnection(pymongo.Connection):
         # TODO: something?
         print 'socket closed', self
 
-    def _send_message(self, message, with_last_error=False):
-        if self._is_async():
-            self._async_send_message(message)
-            # Resume calling greenlet (probably the main greenlet)
-            return greenlet.getcurrent().parent.switch()
-        else:
-            return super(AsyncConnection, self)._send_message(message, with_last_error)
+#    def _send_message(self, message, with_last_error=False):
+#        if self._is_async():
+#            self._async_send_message(message)
+#            # Resume calling greenlet (probably the main greenlet)
+#            return greenlet.getcurrent().parent.switch()
+#        else:
+#            return super(AsyncConnection, self)._send_message(
+#                message,
+#                with_last_error
+#            )
 
     def _receive_data_on_socket(self, length, sock, request_id):
         if self._is_async():
             def callback(data):
-                # TODO: get the *right* greenlet!!
-                list(self.greenlets)[0].switch(data, None)
+                self.greenlet.switch(data, None)
 
             # TODO HACK: is this as good as it gets?
             if not self.__stream:
                 self.__stream = tornado.iostream.IOStream(sock)
                 self.__stream.set_close_callback(self._socket_close)
-                self.__alive = True
             self.__stream.read_bytes(length, callback=callback)
             data, error = greenlet.getcurrent().parent.switch()
             if error:
                 raise error
             return data
         else:
-            return super(AsyncConnection, self)._receive_data_on_socket(length, sock, request_id)
+            return super(AsyncConnection, self)._receive_data_on_socket(
+                length, sock, request_id
+            )
 
     def __repr__(self):
         return 'Async' + super(AsyncConnection, self).__repr__()
@@ -124,7 +129,7 @@ class AsyncCollection(pymongo.collection.Collection):
         @return:                A proxy method that will implement the operation
                                 asynchronously if provided a callback
         """
-        if operation_name not in ('remove', 'update', 'insert', 'save', ):#'find'):
+        if operation_name not in ('remove', 'update', 'insert', 'save', ):
             return super(AsyncCollection, self).__getattribute__(operation_name)
         else:
             def method(*args, **kwargs):
@@ -141,9 +146,7 @@ class AsyncCollection(pymongo.collection.Collection):
                     del kwargs['callback']
 
                     def call_method():
-                        self.connection.greenlets.add(
-                            greenlet.getcurrent()
-                        )
+                        self.connection.greenlet = greenlet.getcurrent()
 
                         result, error = None, None
                         try:
@@ -160,7 +163,8 @@ class AsyncCollection(pymongo.collection.Collection):
                     # Start running the operation
                     result, error = gr.switch()
 
-                    # The operation has completed & we're back on the main greenlet
+                    # The operation has completed & we're back on the main
+                    # greenlet
                     assert not greenlet.getcurrent().parent
                     client_callback(result, error)
 
@@ -186,31 +190,95 @@ class AsyncCollection(pymongo.collection.Collection):
             if not 'read_preference' in kwargs:
                 kwargs['read_preference'] = self.read_preference
 
-            def create_cursor():
-                self.database.connection.greenlets.add(
-                    greenlet.getcurrent()
+            cursor = super(AsyncCollection, self).find(*args, **kwargs)
+            async_cursor = AsyncCursor(cursor)
+
+            def get_first_batch():
+                self.database.connection.greenlet = greenlet.getcurrent()
+                result, error = async_cursor.get_batch()
+
+                # We're still in the child greenlet here, so ensure the callback
+                # is executed on main greenlet
+                tornado.ioloop.IOLoop.instance().add_callback(
+                    lambda: client_callback(result, error)
                 )
 
-                result, error = None, None
-                try:
-                    # TODO: get_more(), tailable cursors
-                    cursor = super(AsyncCollection, self).find(*args, **kwargs)
-                    result = list(cursor)
-                except Exception, e:
-                    error = e
-                client_callback(result, error)
-
-            gr = greenlet.greenlet(create_cursor)
+            gr = greenlet.greenlet(get_first_batch)
 
             # Start running find() in the greenlet
             gr.switch()
+
+            # When the greenlet has sent the query on the socket, it will switch
+            # back to the main greenlet, here, and we return to the caller.
+            return async_cursor
 
     def __repr__(self):
         return 'Async' + super(AsyncCollection, self).__repr__()
 
 
-class AsyncTest(unittest.TestCase):
+class AsyncCursor(object):
+    def __init__(self, cursor):
+        """
+        @param cursor:  Synchronous pymongo cursor
+        """
+        self._sync_cursor = cursor
+
+    def get_batch(self):
+        """
+        Call this on a child greenlet. Returns (result, error).
+        """
+        result, error = None, None
+        try:
+            assert greenlet.getcurrent().parent, "Should be on child greenlet"
+            self._sync_cursor._refresh()
+
+            # TODO: Make this accessible w/o underscore hack
+            result = self._sync_cursor._Cursor__data
+            self._sync_cursor._Cursor__data = []
+        except Exception, e:
+            error = e
+
+        return result, error
+
+    def get_more(self, callback):
+        """
+        Get next batch of data asynchronously.
+        @param callback:    A function taking parameters (result, error)
+        """
+        def next_batch():
+            # This is executed on child greenlet
+            self._sync_cursor.collection.database.connection.greenlet = \
+                greenlet.getcurrent()
+            result, error = self.get_batch()
+
+            # We're still in the child greenlet here, so ensure the callback is
+            # executed on main greenlet
+            tornado.ioloop.IOLoop.instance().add_callback(
+                lambda: callback(result, error)
+            )
+
+        gr = greenlet.greenlet(next_batch)
+        gr.switch()
+
+        # When the greenlet has sent the query on the socket, it will switch
+        # back to the main greenlet, here, and we return to the caller.
+        return None
+
+    @property
+    def alive(self):
+        """Does this cursor have the potential to return more data?"""
+        return self._sync_cursor.alive
+
+    def __repr__(self):
+        return 'Async' + super(AsyncCursor, self).__repr__()
+
+
+class AsyncTest(
+    puritanical.PuritanicalTest,
+    eventually.AssertEventuallyTest
+):
     def setUp(self):
+        super(AsyncTest, self).setUp()
         self.sync_cx = pymongo.Connection()
         self.sync_db = self.sync_cx.test
         self.sync_coll = self.sync_db.test_collection
@@ -225,66 +293,61 @@ class AsyncTest(unittest.TestCase):
         self.assert_(repr(db).startswith('Async'))
         coll = db.test
         self.assert_(repr(coll).startswith('Async'))
-
-    def mongoFindLambda(self, fn):
-        """
-        @param fn:          A function that executes a find() and takes a
-                            callback function.
-        @return:            result, error
-        """
-        result = {}
-        def callback(data, error):
-#            print 'data =', data
-            result['data'] = data
-            result['error'] = error
-            tornado.ioloop.IOLoop.instance().stop()
-
-        fn(callback)
-        tornado.ioloop.IOLoop.instance().start()
-        return result['data'], result['error']
-
-    def assertMongoFoundLambda(self, fn, expected):
-        """
-        Test an async find() command.
-        @param fn:          A function that executes a find() and takes a
-                            callback function.
-        @param expected:    Expected list of values returned
-        """
-        result, error = self.mongoFindLambda(fn)
-        self.assertEqual(None, error)
-        self.assertEqual(expected, result)
-
-    def assertMongoFound(self, query, fields, expected):
-        """
-        Test an async find() command.
-        @param query:       Query, like {'i': {'$gt': 1}}
-        @param fields:      Field selector, like {'_id':false}
-        @param expected:    Expected list of values returned
-        """
-        self.assertMongoFoundLambda(
-            lambda cb: AsyncConnection().test.test_collection.find(
-                query,
-                fields,
-                callback=cb
-            ),
-            expected
-        )
+        cursor = coll.find(callback=lambda: None)
+        self.assert_(repr(cursor).startswith('Async'))
+        cursor = coll.find()
+        self.assertFalse(repr(cursor).startswith('Async'))
 
     def test_find(self):
-        # You know what's weird? MongoDB's default first batch is weird. It's
-        # 101 records or 4MB, whichever comes first.
-        self.assertMongoFound({'_id': 1}, {}, [{'_id': 1}])
+        results = []
+        def callback(result, error):
+            self.assert_(error is None)
+            results.append(result)
+
+        AsyncConnection().test.test_collection.find(
+                {'_id': 1},
+            callback=callback
+        )
+
+        self.assertEventuallyEqual(
+            [{'_id': 1}],
+            lambda: results and results[0]
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
 
     def test_find_default_batch(self):
-        fn = lambda cb: AsyncConnection().test.test_collection.find(
-            callback=cb,
-            sort=[('_id', pymongo.ASCENDING)]
+        results = []
+        cursor = None
+
+        def callback(result, error):
+            self.assert_(error is None)
+            results.append(result)
+            if cursor.alive:
+                cursor.get_more(callback=callback)
+
+        cursor = AsyncConnection().test.test_collection.find(
+            sort=[('_id', pymongo.ASCENDING)],
+            callback=callback
         )
 
         # You know what's weird? MongoDB's default first batch is weird. It's
-        # 101 records or 4MB, whichever comes first.
-        # TODO: why does this return all 1000 results, not 102?!
-        self.assertMongoFoundLambda(fn, [{'_id': i} for i in range(102)])
+        # 100 records or 4MB, whichever comes first.
+        self.assertEventuallyEqual(
+            [{'_id': i} for i in range(101)],
+            lambda: results and results[0]
+        )
+
+        # Next back has remainder of 1000 docs
+        self.assertEventuallyEqual(
+            [{'_id': i} for i in range(101, 1000)],
+            lambda: len(results) >= 2 and results[1]
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
+
+
+# TODO: test SON manipulators
 
 if __name__ == '__main__':
     unittest.main()
