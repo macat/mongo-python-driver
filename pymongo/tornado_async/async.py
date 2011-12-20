@@ -283,7 +283,7 @@ class AsyncTest(
         self.sync_db = self.sync_cx.test
         self.sync_coll = self.sync_db.test_collection
         self.sync_coll.remove()
-        self.sync_coll.insert([{'_id': i} for i in range(1000)], safe=True)
+        self.sync_coll.insert([{'_id': i} for i in range(200)], safe=True)
 
     def test_repr(self):
         cx = AsyncConnection()
@@ -337,9 +337,9 @@ class AsyncTest(
             lambda: results and results[0]
         )
 
-        # Next back has remainder of 1000 docs
+        # Next batch has remainder of 1000 docs
         self.assertEventuallyEqual(
-            [{'_id': i} for i in range(101, 1000)],
+            [{'_id': i} for i in range(101, 200)],
             lambda: len(results) >= 2 and results[1]
         )
 
@@ -363,7 +363,7 @@ class AsyncTest(
 
         expected_results = [
             [{'_id': i} for i in range(start_batch, start_batch + 10)]
-            for start_batch in range(0, 1000, 10)
+            for start_batch in range(0, 200, 10)
         ]
 
         self.assertEventuallyEqual(
