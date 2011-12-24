@@ -14,14 +14,14 @@ class PuritanicalTest(unittest.TestCase):
     def setUp(self):
         super(PuritanicalTest, self).setUp()
 
+        # Clear previous loop
+        if ioloop.IOLoop.initialized():
+            loop = ioloop.IOLoop.instance()
+            if loop:
+                loop.stop()
+            del ioloop.IOLoop._instance
+
         # So any function that calls IOLoop.instance() gets the
         # PuritanicalIOLoop instead of the default loop.
-        if not ioloop.IOLoop.initialized():
-            loop = PuritanicalIOLoop()
-            loop.install()
-        else:
-            loop = ioloop.IOLoop.instance()
-            self.assert_(
-                isinstance(loop, PuritanicalIOLoop),
-                "Couldn't install PuritanicalIOLoop"
-            )
+        loop = PuritanicalIOLoop()
+        loop.install()

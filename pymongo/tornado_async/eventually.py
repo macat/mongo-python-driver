@@ -11,6 +11,10 @@ class AssertEventuallyTest(unittest.TestCase):
         # Callbacks registered with assertEventuallyEqual()
         self.assert_callbacks = set()
 
+#        # Clear callbacks from a previous run
+#        if ioloop.IOLoop.initialized():
+#            ioloop.IOLoop.instance()._callbacks = []
+
     def assertEventuallyEqual(
             self, expected, fn, msg=None, timeout_sec=None
     ):
@@ -20,7 +24,9 @@ class AssertEventuallyTest(unittest.TestCase):
         start = time.time()
         loop = ioloop.IOLoop.instance()
 
-        def callback():
+        def callback(*args, **kwargs):
+            if args or kwargs:
+                pass
             try:
                 self.assertEqual(expected, fn(), msg)
                 # Passed
@@ -28,7 +34,7 @@ class AssertEventuallyTest(unittest.TestCase):
                 if not self.assert_callbacks:
                     # All asserts have passed
                     loop.stop()
-            except AssertionError:
+            except Exception:
                 # Failed -- keep waiting?
                 if time.time() - start < timeout_sec:
                     # Try again in about 0.1 seconds
