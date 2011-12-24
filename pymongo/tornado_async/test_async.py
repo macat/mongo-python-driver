@@ -16,13 +16,30 @@
 
 import unittest
 import sys
+import time
 
 import pymongo
+import pymongo.objectid
 from pymongo.tornado_async import async
 import tornado.ioloop
 
 # Tornado testing tools
 from pymongo.tornado_async import eventually, puritanical
+
+def delay(ms):
+    """
+    Create a delaying $where clause. Note that you can only have one of these
+    Javascript functions running on the server at a time, see SERVER-4258.
+    @param ms:  Time to delay, in milliseconds
+    @return:    A Javascript $where clause that delays for that time
+    """
+    return """
+        function() {
+            var d = new Date((new Date()).getTime() + %d);
+            while (d > (new Date())) { };
+            return true;
+        }
+    """ % ms
 
 
 class AsyncTest(
@@ -147,6 +164,113 @@ class AsyncTest(
 
         tornado.ioloop.IOLoop.instance().start()
 
+    def test_find_is_async(self):
+        """
+        Confirm find() is async by launching three operations which will finish
+        out of order.
+        """
+        # Make a big unindexed collection that will take a long time to query
+        self.sync_db.drop_collection('big_coll')
+        self.sync_db.big_coll.insert([
+            {'s': hex(s)} for s in range(10000)
+        ])
+
+        results = []
+
+        def callback(result, error):
+            #print >> sys.stderr, 'result',result
+            self.assert_(error is None)
+            results.append(result)
+
+        # Launch 3 find operations for _id's 1, 2, and 3, which will finish in
+        # order 2, 3, then 1.
+        loop = tornado.ioloop.IOLoop.instance()
+
+        # This find() takes 1 second
+        loop.add_timeout(
+            time.time() + 0.1,
+            lambda: async.AsyncConnection().test.test_collection.find(
+                {'_id': 1, '$where': delay(1000)},
+                fields={'s': True, '_id': False},
+                callback=callback
+            )
+        )
+
+        # Very fast lookup
+        loop.add_timeout(
+            time.time() + 0.2,
+            lambda: async.AsyncConnection().test.test_collection.find(
+                {'_id': 2},
+                fields={'s': True, '_id': False},
+                callback=callback
+            )
+        )
+
+        # Find {'i': 3} in big_coll -- even though there's only one such record,
+        # MongoDB will have to scan the whole table to know that. We expect this
+        # to be faster than 1 second (the $where clause above) and slower than
+        # the indexed lookup below.
+        loop.add_timeout(
+            time.time() + 0.3,
+            lambda: async.AsyncConnection().test.big_coll.find(
+                {'s': hex(3)},
+                fields={'s': True, '_id': False},
+                callback=callback
+            )
+        )
+
+        # Results were appended in order 2, 3, 1
+        self.assertEventuallyEqual(
+            [[{'s': hex(s)}] for s in (2, 3, 1)],
+            lambda: results
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
+
+    def test_find_one(self):
+        """
+        Confirm find_one() is async by launching two operations which will
+        finish out of order.
+        """
+        results = []
+
+        def callback(result, error):
+            # print >> sys.stderr, 'result',result
+            self.assert_(error is None)
+            results.append(result)
+
+        # Launch 2 find_one operations for _id's 1 and 2, which will finish in
+        # order 2 then 1.
+        loop = tornado.ioloop.IOLoop.instance()
+
+        # This find_one() takes half a second
+        loop.add_timeout(
+            time.time() + 0.1,
+            lambda: async.AsyncConnection().test.test_collection.find(
+                {'_id': 1, '$where': delay(500)},
+                fields={'s': True, '_id': False},
+                callback=callback
+            )
+        )
+
+        # Very fast lookup
+        loop.add_timeout(
+            time.time() + 0.2,
+            lambda: async.AsyncConnection().test.test_collection.find(
+                {'_id': 2},
+                fields={'s': True, '_id': False},
+                callback=callback
+            )
+        )
+
+        # Results were appended in order 2, 1
+        self.assertEventuallyEqual(
+            [[{'s': hex(s)}] for s in (2, 1)],
+            lambda: results
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
+
     def test_update(self):
         results = []
 
@@ -188,12 +312,179 @@ class AsyncTest(
         self.assertEventuallyEqual(1, lambda: len(results))
 
         tornado.ioloop.IOLoop.instance().start()
+            
+    def test_insert(self):
+        results = []
+
+        def callback(result, error):
+            # print >> sys.stderr, 'result', result
+            # print >> sys.stderr, 'error', error
+            self.assert_(error is None)
+            results.append(result)
+
+        async.AsyncConnection().test.test_collection.insert(
+            {'_id': 201},
+            callback=callback,
+        )
+
+        self.assertEventuallyEqual(1, lambda: len(results))
+
+        # insert() returns new _id
+        self.assertEventuallyEqual(201, lambda: results[0])
+
+        tornado.ioloop.IOLoop.instance().start()
+
+    def test_insert_many(self):
+        results = []
+
+        def callback(result, error):
+            # print >> sys.stderr, 'result', result
+            # print >> sys.stderr, 'error', error
+            self.assert_(error is None)
+            results.append(result)
+
+        async.AsyncConnection().test.test_collection.insert(
+            [{'_id': i, 's': hex(i)} for i in range(201, 211)],
+            callback=callback,
+        )
+
+        self.assertEventuallyEqual(1, lambda: len(results))
+        self.assertEventuallyEqual(range(201, 211), lambda: results[0])
+
+        tornado.ioloop.IOLoop.instance().start()
+
+    def test_insert_bad(self):
+        """
+        Violate a unique index, make sure we handle error well
+        """
+        results = []
+
+        def callback(result, error):
+            print >> sys.stderr, 'result', result
+            print >> sys.stderr, 'error', error
+            self.assert_(isinstance(error, pymongo.errors.DuplicateKeyError))
+            self.assertEqual(None, result)
+            results.append(result)
+
+        async.AsyncConnection().test.test_collection.insert(
+            {'s': hex(4)}, # There's already a document with s: hex(4)
+            callback=callback,
+        )
+
+        self.assertEventuallyEqual(1, lambda: len(results))
+
+        tornado.ioloop.IOLoop.instance().start()
+        
+    def test_insert_many_one_bad(self):
+        """
+        Violate a unique index in one of many updates, make sure we handle error
+        well
+        """
+        results = []
+
+        def callback(result, error):
+            # print >> sys.stderr, 'result', result
+            # print >> sys.stderr, 'error', error
+            self.assert_(isinstance(error, pymongo.errors.DuplicateKeyError))
+            results.append(result)
+
+        async.AsyncConnection().test.test_collection.insert(
+            [
+                {'_id': 201, 's': hex(201)},
+                {'_id': 202, 's': hex(4)}, # Already exists
+                {'_id': 203, 's': hex(203)},
+            ],
+            callback=callback,
+        )
+
+        self.assertEventuallyEqual(1, lambda: len(results))
+        self.assertEventuallyEqual(None, lambda: results[0])
+
+        tornado.ioloop.IOLoop.instance().start()
+
+        # First insert should've succeeded
+        self.assertEqual(
+            [{'_id': 201, 's': hex(201)}],
+            list(self.sync_db.test_collection.find({'_id': 201}))
+        )
+
+        # Final insert didn't execute, since second failed
+        self.assertEqual(
+            [],
+            list(self.sync_db.test_collection.find({'_id': 203}))
+        )
+
+    def test_save_with_id(self):
+        results = []
+
+        def callback(result, error):
+            # print >> sys.stderr, 'result', result
+            self.assert_(error is None)
+            results.append(result)
+
+        async.AsyncConnection().test.test_collection.save(
+            {'_id': 5},
+            callback=callback,
+        )
+
+        self.assertEventuallyEqual(1, lambda: len(results))
+
+        # save() returns the _id, in this case 5
+        self.assertEventuallyEqual(5, lambda: results[0])
+
+        tornado.ioloop.IOLoop.instance().start()
+
+    def test_save_without_id(self):
+        results = []
+
+        def callback(result, error):
+            print >> sys.stderr, 'result', result
+            print >> sys.stderr, 'error', error
+            self.assert_(error is None)
+            results.append(result)
+
+        async.AsyncConnection().test.test_collection.save(
+            {'fiddle': 'faddle'},
+            callback=callback,
+        )
+
+        self.assertEventuallyEqual(1, lambda: len(results))
+
+        # save() returns the new _id
+        self.assertEventuallyEqual(
+            True,
+            lambda: isinstance(results[0], pymongo.objectid.ObjectId)
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
+
+    def test_save_bad(self):
+        """
+        Violate a unique index, make sure we handle error well
+        """
+        results = []
+
+        def callback(result, error):
+            self.assert_(isinstance(error, pymongo.errors.DuplicateKeyError))
+            self.assertEqual(None, result)
+            results.append(result)
+
+        async.AsyncConnection().test.test_collection.save(
+            {'_id': 5},
+            {'$set': {'s': hex(4)}}, # There's already a document with s: hex(4)
+            callback=callback,
+        )
+
+        self.assertEventuallyEqual(1, lambda: len(results))
+
+        tornado.ioloop.IOLoop.instance().start()
+
+
 
 
 # TODO: test insert, save, remove
-# TODO: test SON manipulators
-# TODO: test that it's really async, use asyncmongo test for inspiration
-# TODO: replicate asyncmongo's whole test suite
+# TODO: test that unsafe operations don't call the callback
+# TODO: replicate asyncmongo's whole test suite?
 # TODO: apply pymongo's whole suite to async
 
 if __name__ == '__main__':
