@@ -551,6 +551,8 @@ class Collection(common.BaseObject):
             the start of the result set) when returning the results
           - `limit` (optional): the maximum number of results to
             return
+          - `batch_size` (optional): the number of results to return in each
+            batch
           - `timeout` (optional): if True, any returned cursor will be
             subject to the normal timeout behavior of the mongod
             process. Otherwise, the returned cursor will never timeout
@@ -601,6 +603,9 @@ class Collection(common.BaseObject):
 
         .. versionadded:: 1.11+
            The `await_data`, `partial`, and `manipulate` parameters.
+
+        .. versionadded:: 2.2
+           The `batch_size` parameter.
 
         .. versionadded:: 1.8
            The `network_timeout` parameter.
