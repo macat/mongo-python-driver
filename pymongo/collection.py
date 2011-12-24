@@ -231,10 +231,10 @@ class Collection(common.BaseObject):
             raise TypeError("cannot save object of type %s" % type(to_save))
 
         if "_id" not in to_save:
-            return self.insert(to_save, manipulate, safe, **kwargs)
+            return self.insert(to_save, manipulate, safe=safe, **kwargs)
         else:
             self.update({"_id": to_save["_id"]}, to_save, True,
-                        manipulate, safe, _check_keys=True, **kwargs)
+                        manipulate, _check_keys=True, safe=safe, **kwargs)
             return to_save.get("_id", None)
 
     def insert(self, doc_or_docs, manipulate=True,
