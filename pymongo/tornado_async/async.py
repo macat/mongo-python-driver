@@ -146,7 +146,7 @@ class AsyncCollection(pymongo.collection.Collection):
                 client_callback = kwargs.get('callback', None)
                 if not client_callback:
                     # Synchronous call, normal pymongo processing
-                    return sync_method
+                    return sync_method(*args, **kwargs)
                 else:
                     # Async call. Since we have a callback, we pass safe=True.
                     del kwargs['callback']
@@ -215,6 +215,27 @@ class AsyncCollection(pymongo.collection.Collection):
             # back to the main greenlet, here, and we return to the caller.
             return async_cursor
 
+    def find_one(self, *args, **kwargs):
+        if 'callback' not in kwargs:
+            # Synchronous
+            return super(AsyncCollection, self).find_one(*args, **kwargs)
+
+        if 'limit' in kwargs:
+            raise ArgumentError("'limit' argument not allowed for find_one")
+
+        # TODO: must we copy kwargs?
+        client_callback = kwargs['callback']
+        del kwargs['callback']
+
+        def find_one_callback(result, error):
+            # Turn single-document list into a plain document
+            assert result is None or len(result) == 1
+            client_callback(result[0] if result else None, error)
+
+        # TODO: python2.4-compatible?
+        self.find(*args, limit=-1, callback=find_one_callback, **kwargs)
+        return None
+
     def __repr__(self):
         return 'Async' + super(AsyncCollection, self).__repr__()
 
@@ -225,6 +246,7 @@ class AsyncCursor(object):
         @param cursor:  Synchronous pymongo cursor
         """
         self._sync_cursor = cursor
+        self.started = False
 
     def get_batch(self):
         """
@@ -233,6 +255,7 @@ class AsyncCursor(object):
         result, error = None, None
         try:
             assert greenlet.getcurrent().parent, "Should be on child greenlet"
+            self.started = True
             self._sync_cursor._refresh()
 
             # TODO: Make this accessible w/o underscore hack
@@ -248,6 +271,8 @@ class AsyncCursor(object):
         Get next batch of data asynchronously.
         @param callback:    A function taking parameters (result, error)
         """
+        assert self.started
+
         def next_batch():
             # This is executed on child greenlet
             self._sync_cursor.collection.database.connection.greenlet = \
@@ -272,3 +297,23 @@ class AsyncCursor(object):
         """Does this cursor have the potential to return more data?"""
         return self._sync_cursor.alive
 
+    def __getattr__(self, name):
+        """
+        Support the chaining operators on cursors like limit() and batch_size()
+        """
+        if name in (
+            'add_option', 'remove_option', 'limit', 'batch_size', 'skip',
+            'max_scan', 'sort', 'count', 'distinct', 'hint', 'where',
+        ):
+            assert not self.started
+
+            def op(*args, **kwargs):
+                # Apply the chaining operator to the Cursor
+                getattr(self._sync_cursor, name)(*args, **kwargs)
+
+                # Return the AsyncCursor
+                return self
+
+            return op
+        else:
+            raise AttributeError
