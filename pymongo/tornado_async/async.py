@@ -15,12 +15,13 @@
 """Tornado asynchronous Python driver for MongoDB."""
 
 import socket
+import sys # TODO: remove once print statements are gone
 
 import tornado.ioloop, tornado.iostream
 import greenlet
 
 import pymongo
-from pymongo.errors import ConnectionFailure
+from pymongo.errors import ConnectionFailure, InvalidOperation
 
 class AsyncConnection(pymongo.Connection):
     def __init__(self, *args, **kwargs):
@@ -252,9 +253,9 @@ class AsyncCursor(object):
         """
         Call this on a child greenlet. Returns (result, error).
         """
+        assert greenlet.getcurrent().parent, "Should be on child greenlet"
         result, error = None, None
         try:
-            assert greenlet.getcurrent().parent, "Should be on child greenlet"
             self.started = True
             self._sync_cursor._refresh()
 
@@ -303,9 +304,16 @@ class AsyncCursor(object):
         """
         if name in (
             'add_option', 'remove_option', 'limit', 'batch_size', 'skip',
-            'max_scan', 'sort', 'count', 'distinct', 'hint', 'where',
+            'max_scan', 'sort', 'count', 'distinct', 'hint', 'where', 'explain'
         ):
-            assert not self.started
+            if self.started:
+                # TODO: don't raise exception in __getattr__, raise it when the
+                # function's actually *called*
+                raise InvalidOperation(
+                    # TODO: better explanation, must pass callback in final
+                    # chaining operator
+                    "Can't call \"%s\" on a cursor once it's started"
+                )
 
             def op(*args, **kwargs):
                 # Apply the chaining operator to the Cursor
@@ -316,4 +324,4 @@ class AsyncCursor(object):
 
             return op
         else:
-            raise AttributeError
+            raise AttributeError(name)
