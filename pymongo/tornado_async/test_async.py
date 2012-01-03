@@ -76,14 +76,15 @@ class AsyncTest(
         # We're not actually running the find(), so null callback is ok
         cursor = coll.find(callback=lambda: None)
         self.assert_(isinstance(cursor, async.AsyncCursor))
-        self.assertFalse(cursor.started)
+        self.assert_(cursor.started, "Cursor should start immediately")
         cursor = coll.find()
         self.assertFalse(isinstance(cursor, async.AsyncCursor))
 
     def test_find(self):
         results = []
         def callback(result, error):
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         async.AsyncConnection().test.test_collection.find(
@@ -103,7 +104,8 @@ class AsyncTest(
         cursor = None
 
         def callback(result, error):
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
             if cursor.alive:
                 cursor.get_more(callback=callback)
@@ -137,7 +139,8 @@ class AsyncTest(
         cursor = None
 
         def callback(result, error):
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
             if cursor.alive:
                 cursor.get_more(callback=callback)
@@ -169,7 +172,8 @@ class AsyncTest(
         """
         results = []
         def callback(result, error):
-            print >> sys.stderr, error
+            if error:
+                raise error
             self.assert_(error is None, str(error))
             results.append(result)
 
@@ -191,7 +195,7 @@ class AsyncTest(
             ('hint', ('index_name',)),
             ('where', ('where_clause', )),
         ]:
-            cursor = test_collection.find(
+            cursor_with_callback = test_collection.find(
                 {'_id': 1},
                 callback=callback
             )
@@ -201,13 +205,26 @@ class AsyncTest(
             # cursor.
             self.assertRaises(
                 pymongo.errors.InvalidOperation,
-                lambda: getattr(cursor, opname)
+                lambda: getattr(cursor_with_callback, opname)(*params)
             )
 
         self.assertEventuallyEqual(
             [{'_id': 1, 's': hex(1)}],
             lambda: results[0]
         )
+
+        tornado.ioloop.IOLoop.instance().start()
+
+        results = []
+        cursor = test_collection.find().limit(5).sort('foo', pymongo.ASCENDING)
+        cursor.batch_size(5, callback=callback)
+
+        expected_results = [
+            [{'_id': i, 's': hex(i)}]
+            for j in range(2) for i in range(5 * j, 5 * (j+1))
+        ]
+
+        self.assertEventuallyEqual(expected_results, lambda: results[0])
 
         tornado.ioloop.IOLoop.instance().start()
 
@@ -226,16 +243,19 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result',result
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         # Launch 3 find operations for _id's 1, 2, and 3, which will finish in
         # order 2, 3, then 1.
         loop = tornado.ioloop.IOLoop.instance()
 
+        now = time.time()
+
         # This find() takes 1 second
         loop.add_timeout(
-            time.time() + 0.1,
+            now + 0.1,
             lambda: async.AsyncConnection().test.test_collection.find(
                 {'_id': 1, '$where': delay(1000)},
                 fields={'s': True, '_id': False},
@@ -245,7 +265,7 @@ class AsyncTest(
 
         # Very fast lookup
         loop.add_timeout(
-            time.time() + 0.2,
+            now + 0.2,
             lambda: async.AsyncConnection().test.test_collection.find(
                 {'_id': 2},
                 fields={'s': True, '_id': False},
@@ -258,7 +278,7 @@ class AsyncTest(
         # to be faster than 1 second (the $where clause above) and slower than
         # the indexed lookup above.
         loop.add_timeout(
-            time.time() + 0.3,
+            now + 0.3,
             lambda: async.AsyncConnection().test.big_coll.find(
                 {'s': hex(3)},
                 fields={'s': True, '_id': False},
@@ -269,7 +289,8 @@ class AsyncTest(
         # Results were appended in order 2, 3, 1
         self.assertEventuallyEqual(
             [[{'s': hex(s)}] for s in (2, 3, 1)],
-            lambda: results
+            lambda: results,
+            timeout_sec=1.3
         )
 
         tornado.ioloop.IOLoop.instance().start()
@@ -277,7 +298,8 @@ class AsyncTest(
     def test_find_one(self):
         results = []
         def callback(result, error):
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         async.AsyncConnection().test.test_collection.find_one(
@@ -302,7 +324,8 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result',result
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         # Launch 2 find_one operations for _id's 1 and 2, which will finish in
@@ -341,7 +364,8 @@ class AsyncTest(
         results = []
 
         def callback(result, error):
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         async.AsyncConnection().test.test_collection.update(
@@ -384,8 +408,8 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result', result
-            # print >> sys.stderr, 'error', error
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         async.AsyncConnection().test.test_collection.insert(
@@ -404,8 +428,8 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result', result
-            # print >> sys.stderr, 'error', error
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         async.AsyncConnection().test.test_collection.insert(
@@ -426,7 +450,6 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result', result
-            # print >> sys.stderr, 'error', error
             self.assert_(isinstance(error, pymongo.errors.DuplicateKeyError))
             self.assertEqual(None, result)
             results.append(result)
@@ -449,7 +472,6 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result', result
-            # print >> sys.stderr, 'error', error
             self.assert_(isinstance(error, pymongo.errors.DuplicateKeyError))
             results.append(result)
 
@@ -487,7 +509,8 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result', result
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         async.AsyncConnection().test.test_collection.save(
@@ -506,8 +529,8 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result', result
-            # print >> sys.stderr, 'error', error
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         async.AsyncConnection().test.test_collection.save(
@@ -531,7 +554,6 @@ class AsyncTest(
         results = []
 
         def callback(result, error):
-            # print >> sys.stderr, "error", error
             self.assert_(isinstance(error, pymongo.errors.DuplicateKeyError))
             self.assertEqual(None, result)
             results.append(result)
@@ -546,7 +568,7 @@ class AsyncTest(
         tornado.ioloop.IOLoop.instance().start()
         self.assertEqual(1, len(results))
 
-    def test_save_multiple(self):
+    def __test_save_multiple(self):
         """
         TODO: what are we testing here really?
         """
@@ -554,8 +576,8 @@ class AsyncTest(
 
         def callback(result, error):
             # print >> sys.stderr, 'result',result
-            # print >> sys.stderr, 'error', error
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         loop = tornado.ioloop.IOLoop.instance()
@@ -580,7 +602,8 @@ class AsyncTest(
         """
         results = []
         def callback(result, error):
-            self.assert_(error is None)
+            if error:
+                raise error
             results.append(result)
 
         async.AsyncConnection().test.test_collection.remove(
@@ -615,27 +638,25 @@ class AsyncTest(
         """
         async.AsyncConnection().test.test_collection.insert({'_id': 201})
 
-        # Make sure the insert completes
-        time.sleep(0.2)
-
-        self.assertEqual(
+        self.assertEventuallyEqual(
             1,
-            len(list(self.sync_db.test_collection.find({'_id': 201})))
+            lambda: len(list(self.sync_db.test_collection.find({'_id': 201})))
         )
-        
+
+        tornado.ioloop.IOLoop.instance().start()
+
     def test_unsafe_save(self):
         """
         Test that unsafe saves with no callback still work
         """
         async.AsyncConnection().test.test_collection.save({'_id': 201})
 
-        # Make sure the save completes
-        time.sleep(0.2)
-
-        self.assertEqual(
+        self.assertEventuallyEqual(
             1,
-            len(list(self.sync_db.test_collection.find({'_id': 201})))
+            lambda: len(list(self.sync_db.test_collection.find({'_id': 201})))
         )
+
+        tornado.ioloop.IOLoop.instance().start()
 
 # TODO: test that save and insert are async somehow? MongoDB's database-wide
 #     write lock makes this hard. Maybe with two mongod instances.
@@ -647,4 +668,6 @@ class AsyncTest(
 
 
 if __name__ == '__main__':
+#    import greenlet
+#    print >> sys.stderr, "main greenlet:", greenlet.getcurrent()
     unittest.main()

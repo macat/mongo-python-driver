@@ -1,4 +1,5 @@
 import sys
+import traceback
 import unittest
 from tornado import ioloop
 
@@ -8,6 +9,7 @@ class PuritanicalIOLoop(ioloop.IOLoop):
     """
     def handle_callback_exception(self, callback):
         exc_type, exc_value, tb = sys.exc_info()
+        traceback.print_tb(tb, file=sys.stderr)
         raise exc_value
 
 class PuritanicalTest(unittest.TestCase):
