@@ -15,30 +15,39 @@
 """Tornado asynchronous Python driver for MongoDB."""
 
 import socket
-import sys # TODO: remove once print statements are gone
+
+have_ssl = True
+try:
+    import ssl
+except ImportError:
+    have_ssl = False
 
 import tornado.ioloop, tornado.iostream
 import greenlet
-import time
+import os
 
 import pymongo
-from pymongo.connection import _Pool
 from pymongo.errors import ConnectionFailure, InvalidOperation
 
 
 # TODO: sphinx-formatted docstrings
+# TODO: simplify by removing the sync / async if callback logic, all commands
+#   on Async* classes must be async, must have callback if expect result like
+#   find(). Making AsyncConnection.open() has made this possible I think.
+# TODO: AsyncCursor.__del__() kills cursor *asynchronously* if necessary;
+#   include a cursor count in all tests
 
 class AsyncSocket(object):
     """
     Replace socket with a class that yields from the current greenlet, if we're
     on a child greenlet, when making blocking calls, and uses Tornado IOLoop to
-    wait for socket events to resume child greenlet.
+    schedule child greenlet for resumption when I/O is ready.
 
     We only implement those socket methods actually used by pymongo: connect,
     sendall, and recv.
     """
-    def __init__(self, *args, **kwargs):
-        self.socket = socket.socket(*args, **kwargs)
+    def __init__(self, sock):
+        self.socket = sock
         self._stream = None
 
     # Proxy some socket methods
@@ -116,24 +125,140 @@ class AsyncSocket(object):
 #            child_gr.parent, time.time()
 #        )
         return child_gr.parent.switch()
-#
-#class AsyncPool(pymongo.connection._Pool):
-#    def get_socket(self, host, port):
-#        sock = super(AsyncPool, self).get_socket(host, port)
-#        return AsyncSocket(sock)
 
-class AsyncConnection(pymongo.Connection):
+    def close(self):
+        self.stream.close()
+
+class AsyncPool(object):
+    """A simple connection pool of AsyncSockets.
+    """
+
+    def __init__(self, max_size, net_timeout, conn_timeout, use_ssl):
+        self.pid = os.getpid()
+        self.max_size = max_size
+
+        # TODO: how do connection and net timeouts work w/ non-blocking sockets?
+        self.net_timeout = net_timeout
+        self.conn_timeout = conn_timeout
+        self.use_ssl = use_ssl
+        self.sockets = []
+
+    def connect(self, host, port):
+        """Connect to Mongo and return a new connected socket.
+        """
+        assert greenlet.getcurrent().parent, "Should be on child greenlet"
+        try:
+            # Prefer IPv4. If there is demand for an option
+            # to specify one or the other we can add it later.
+            s = socket.socket(socket.AF_INET)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except socket.gaierror:
+            # If that fails try IPv6
+            s = socket.socket(socket.AF_INET6)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        async_sock = AsyncSocket(s)
+
+        # AsyncSocket will pause the current greenlet and resume it when
+        # connection has completed
+        async_sock.connect((host, port))
+
+        if self.use_ssl:
+            try:
+                # TODO: ugly
+                async_sock.socket = ssl.wrap_socket(async_sock.socket)
+            except ssl.SSLError:
+                async_sock.close()
+                raise ConnectionFailure("SSL handshake failed. MongoDB may "
+                                        "not be configured with SSL support.")
+
+        return async_sock
+
+
+    def get_socket(self, host, port):
+        # Unlike pymongo.Pool's get_socket(), we give out a socket here to
+        # which the caller has exclusive access until it closes the socket or
+        # calls return_socket().
+
+        # We use the pid here to avoid issues with fork / multiprocessing.
+        # See test.test_connection:TestConnection.test_fork for an example of
+        # what could go wrong otherwise
+        pid = os.getpid()
+
+        if pid != self.pid:
+            self.sockets = []
+            self.pid = pid
+
+        try:
+            sock = (pid, self.sockets.pop())
+            return (sock[1], True)
+        except IndexError:
+            sock = (pid, self.connect(host, port))
+            return (sock[1], False)
+
+    def return_socket(self, sock):
+        # TODO: what if a socket created in a parent process is returned here
+        # after a fork?
+        #if self.sock is not None and self.sock[0] == os.getpid():
+
+        # There's a race condition here, but we deliberately
+        # ignore it.  It means that if the pool_size is 10 we
+        # might actually keep slightly more than that.
+        if len(self.sockets) < self.max_size:
+            self.sockets.append(sock)
+        else:
+            sock.close()
+
+
+class AsyncConnection(object):
     def __init__(self, *args, **kwargs):
-        super(AsyncConnection, self).__init__(*args, **kwargs)
-        # Replace the standard _Pool with an AsyncSocket-producing pool
-        # TODO: Don't require overriding private attribute
-        self._Connection__pool = _Pool(
-            self._Connection__max_pool_size,
-            self._Connection__net_timeout,
-            self._Connection__conn_timeout,
-            self._Connection__use_ssl,
-            socket_factory=AsyncSocket
-        )
+        # Store args and kwargs for when open() is called
+        self.__init_args = args
+        self.__init_kwargs = kwargs
+
+        # The synchronous pymongo Connection
+        self.sync_connection = None
+        self.connected = False
+
+    def open(self, callback):
+        """
+        Actually connect, passing self to a callback when connected.
+        @param callback: Optional function taking parameters (connection, error)
+        """
+        def connect():
+            # Run on child greenlet
+            error = None
+            try:
+                cx = self.sync_connection = pymongo.Connection(
+                    *self.__init_args,
+                    **self.__init_kwargs
+                )
+                
+                # Replace the standard _Pool with an AsyncSocket-producing pool
+                # TODO: Don't require accessing private attributes
+                cx._Connection__pool = AsyncPool(
+                    cx.max_pool_size,
+                    cx._Connection__net_timeout,
+                    cx._Connection__conn_timeout,
+                    cx._Connection__use_ssl
+                )
+
+                self.connected = True
+            except Exception, e:
+                error = e
+
+            if callback:
+                # Schedule callback to be executed on main greenlet, with
+                # (self, None) if no error, else (None, error)
+                tornado.ioloop.IOLoop.instance().add_callback(
+                    lambda: callback(
+                        None if error else self,
+                        error
+                    )
+                )
+
+        # Actually connect on a child greenlet
+        greenlet.greenlet(connect).switch()
 
     def __getattr__(self, name):
         """Get a database by name.
@@ -144,10 +269,22 @@ class AsyncConnection(pymongo.Connection):
         :Parameters:
           - `name`: the name of the database to get
         """
-        return AsyncDatabase(self, name)
+        if not self.connected:
+            raise InvalidOperation(
+                "Can't access database on AsyncConnection before calling"
+                " connect()"
+            )
+        return AsyncDatabase(self.sync_connection, name)
 
     def __repr__(self):
-        return 'Async' + super(AsyncConnection, self).__repr__()
+        return 'AsyncConnection(%s)' % (
+            ','.join([
+                i for i in [
+                    ','.join(self.__init_args),
+                    ','.join(self.__init_kwargs),
+                ] if i
+            ])
+        )
 
 class AsyncDatabase(pymongo.database.Database):
     def __getattr__(self, collection_name):
@@ -204,10 +341,8 @@ class AsyncCollection(pymongo.collection.Collection):
                             lambda: client_callback(result, error)
                         )
 
-                child_gr = greenlet.greenlet(call_method)
-
-                # Start running the operation
-                child_gr.switch()
+                # Start running the operation on greenlet
+                greenlet.greenlet(call_method).switch()
 
             return method
 
@@ -270,8 +405,7 @@ class AsyncCollection(pymongo.collection.Collection):
                 )
 
             # Start running find() in the greenlet
-            gr = greenlet.greenlet(get_first_batch)
-            gr.switch()
+            greenlet.greenlet(get_first_batch).switch()
 
             # When the greenlet has sent the query on the socket, it will switch
             # back to the main greenlet, here, and we return to the caller.
@@ -313,8 +447,8 @@ class AsyncCursor(object):
         """
         @param cursor:  Synchronous pymongo cursor
         """
-        self._sync_cursor = cursor
-        self.started = False
+        self.__sync_cursor = cursor
+        self.started_async = False
 
     def get_batch(self):
         """
@@ -323,12 +457,12 @@ class AsyncCursor(object):
         assert greenlet.getcurrent().parent, "Should be on child greenlet"
         result, error = None, None
         try:
-            self.started = True
-            self._sync_cursor._refresh()
+            self.started_async = True
+            self.__sync_cursor._refresh()
 
             # TODO: Make this accessible w/o underscore hack
-            result = self._sync_cursor._Cursor__data
-            self._sync_cursor._Cursor__data = []
+            result = self.__sync_cursor._Cursor__data
+            self.__sync_cursor._Cursor__data = []
         except Exception, e:
             error = e
 
@@ -339,22 +473,20 @@ class AsyncCursor(object):
         Get next batch of data asynchronously.
         @param callback:    A function taking parameters (result, error)
         """
-        assert self.started, "get_more() called on cursor before it has started"
+        assert self.started_async, (
+            "get_more() called on cursor before it has started"
+        )
 
         def next_batch():
             # This is executed on child greenlet
-            self._sync_cursor.collection.database.connection.greenlet = \
-                greenlet.getcurrent()
             result, error = self.get_batch()
 
-            # We're still in the child greenlet here, so ensure the callback is
-            # executed on main greenlet
+            # Execute callback on main greenlet
             tornado.ioloop.IOLoop.instance().add_callback(
                 lambda: callback(result, error)
             )
 
-        gr = greenlet.greenlet(next_batch)
-        gr.switch()
+        greenlet.greenlet(next_batch).switch()
 
         # When the greenlet has sent the query on the socket, it will switch
         # back to the main greenlet, here, and we return to the caller.
@@ -363,7 +495,7 @@ class AsyncCursor(object):
     @property
     def alive(self):
         """Does this cursor have the potential to return more data?"""
-        return self._sync_cursor.alive
+        return self.__sync_cursor.alive
 
     def __getattr__(self, name):
         """
@@ -374,7 +506,7 @@ class AsyncCursor(object):
             'max_scan', 'sort', 'count', 'distinct', 'hint', 'where', 'explain'
         ):
             def op(*args, **kwargs):
-                if self.started:
+                if self.started_async:
                     raise InvalidOperation(
                         # TODO: better explanation, must pass callback in final
                         # chaining operator
@@ -390,7 +522,7 @@ class AsyncCursor(object):
                     del kwargs['callback']
 
                 # Apply the chaining operator to the Cursor
-                getattr(self._sync_cursor, name)(*args, **kwargs)
+                getattr(self.__sync_cursor, name)(*args, **kwargs)
 
                 # Return the AsyncCursor
                 return self

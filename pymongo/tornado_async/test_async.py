@@ -14,7 +14,6 @@
 
 """Test the Tornado asynchronous Python driver for MongoDB."""
 
-import functools
 import sys
 import time
 import unittest
@@ -52,12 +51,32 @@ class AsyncTest(
         self.sync_cx = pymongo.Connection()
         self.sync_db = self.sync_cx.test
         self.sync_coll = self.sync_db.test_collection
+
+        # Make some test data
         self.sync_coll.remove()
         self.sync_coll.ensure_index([('s', pymongo.ASCENDING)], unique=True)
         self.sync_coll.insert(
             [{'_id': i, 's': hex(i)} for i in range(200)],
             safe=True
         )
+
+    def async_connection(self):
+        cx = async.AsyncConnection()
+        loop = tornado.ioloop.IOLoop.instance()
+
+        def connected(connection, error):
+            loop.stop() # So we can exit async_connection()
+            if error:
+                raise error
+
+        cx.open(connected)
+        loop.start()
+        assert cx.connected, "Couldn't connect to MongoDB"
+        return cx
+
+    def tearDown(self):
+        self.sync_coll.remove()
+        super(AsyncTest, self).tearDown()
 
     def test_repr(self):
         cx = async.AsyncConnection()
@@ -67,35 +86,82 @@ class AsyncTest(
         coll = db.test
         self.assert_(repr(coll).startswith('AsyncCollection'))
 
+    def test_connection(self):
+        cx = async.AsyncConnection()
+
+        # Can't access databases before connecting
+        self.assertRaises(
+            pymongo.errors.InvalidOperation,
+            lambda: cx.some_database_name
+        )
+
+        self.assertRaises(
+            pymongo.errors.InvalidOperation,
+            lambda: cx.some_database_name
+        )
+
+        called = {'callback': False}
+
+        def callback(connection, error):
+            called['callback'] = True
+            if error:
+                raise error
+
+        self.assertEventuallyEqual(
+            True,
+            lambda: cx.connected
+        )
+
+        self.assertEventuallyEqual(
+            True,
+            lambda: called['callback']
+        )
+
+        cx.open(callback)
+
+        tornado.ioloop.IOLoop.instance().start()
+
     def test_cursor(self):
         """
         Test that we get a regular Cursor if we don't pass a callback to find(),
         and we get an AsyncCursor if we do pass a callback.
         """
-        coll = async.AsyncConnection().test.foo
+        cx = self.async_connection()
+        coll = cx.test.foo
         # We're not actually running the find(), so null callback is ok
         cursor = coll.find(callback=lambda: None)
         self.assert_(isinstance(cursor, async.AsyncCursor))
-        self.assert_(cursor.started, "Cursor should start immediately")
+        self.assert_(cursor.started_async, "Cursor should start immediately")
         cursor = coll.find()
         self.assertFalse(isinstance(cursor, async.AsyncCursor))
 
     def test_find(self):
         results = []
-        def callback(result, error):
+
+        # Although in most tests I'm using the synchronized
+        # self.async_connection() for convienience, here I'll really test
+        # passing a callback to open() that does a find(), just to make sure
+        # that works in the Node.js-driver style.
+        def connected(connection, error):
+            if error:
+                raise error
+
+            connection.test.test_collection.find(
+                {'_id': 1},
+                callback=found
+            )
+
+        def found(result, error):
             if error:
                 raise error
             results.append(result)
-
-        async.AsyncConnection().test.test_collection.find(
-            {'_id': 1},
-            callback=callback
-        )
 
         self.assertEventuallyEqual(
             [{'_id': 1, 's': hex(1)}],
             lambda: results[0]
         )
+
+        async.AsyncConnection().open(callback=connected)
 
         tornado.ioloop.IOLoop.instance().start()
 
@@ -110,7 +176,7 @@ class AsyncTest(
             if cursor.alive:
                 cursor.get_more(callback=callback)
 
-        cursor = async.AsyncConnection().test.test_collection.find(
+        cursor = self.async_connection().test.test_collection.find(
             {},
             {'s': 0}, # Don't return the 's' field
             sort=[('_id', pymongo.ASCENDING)],
@@ -145,7 +211,7 @@ class AsyncTest(
             if cursor.alive:
                 cursor.get_more(callback=callback)
 
-        cursor = async.AsyncConnection().test.test_collection.find(
+        cursor = self.async_connection().test.test_collection.find(
             {},
             {'s': 0}, # Don't return the 's' field
             sort=[('_id', pymongo.ASCENDING)],
@@ -166,9 +232,15 @@ class AsyncTest(
 
         tornado.ioloop.IOLoop.instance().start()
 
-    def test_chaining(self):
+    def __disabled__test_chaining(self):
         """
-        Test chaining operations like db.test.find().batch_size(5).limit(10)
+        Test chaining operations. The idea is to support an API like:
+            db.test.find().batch_size(5).limit(10, callback=my_callback)
+        ... where callback must be an argument to the *last* chained operator,
+        triggering the cursor to actually launch the operation. But at the
+        moment I'm abandoning this idea and requiring you to pass in batch_size,
+        limit, etc. as keyword arguments to find() along with the callback, and
+        I'm saying you can't do chaining with async.
         """
         results = []
         def callback(result, error):
@@ -177,7 +249,7 @@ class AsyncTest(
             self.assert_(error is None, str(error))
             results.append(result)
 
-        test_collection = async.AsyncConnection().test.test_collection
+        test_collection = self.async_connection().test.test_collection
 
         for opname, params in [
             ('limit', (5, )),
@@ -231,13 +303,16 @@ class AsyncTest(
     def test_find_is_async(self):
         """
         Confirm find() is async by launching three operations which will finish
-        out of order.
+        out of order. Also test that AsyncConnection doesn't reuse sockets
+        incorrectly.
         """
         # Make a big unindexed collection that will take a long time to query
         self.sync_db.drop_collection('big_coll')
         self.sync_db.big_coll.insert([
             {'s': hex(s)} for s in range(10000)
         ])
+
+        cx = self.async_connection()
 
         results = []
 
@@ -256,7 +331,7 @@ class AsyncTest(
         # This find() takes 1 second
         loop.add_timeout(
             now + 0.1,
-            lambda: async.AsyncConnection().test.test_collection.find(
+            lambda: cx.test.test_collection.find(
                 {'_id': 1, '$where': delay(1000)},
                 fields={'s': True, '_id': False},
                 callback=callback
@@ -266,7 +341,7 @@ class AsyncTest(
         # Very fast lookup
         loop.add_timeout(
             now + 0.2,
-            lambda: async.AsyncConnection().test.test_collection.find(
+            lambda: cx.test.test_collection.find(
                 {'_id': 2},
                 fields={'s': True, '_id': False},
                 callback=callback
@@ -279,7 +354,7 @@ class AsyncTest(
         # the indexed lookup above.
         loop.add_timeout(
             now + 0.3,
-            lambda: async.AsyncConnection().test.big_coll.find(
+            lambda: cx.test.big_coll.find(
                 {'s': hex(3)},
                 fields={'s': True, '_id': False},
                 callback=callback
@@ -302,7 +377,7 @@ class AsyncTest(
                 raise error
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.find_one(
+        self.async_connection().test.test_collection.find_one(
             {'_id': 1},
             callback=callback
         )
@@ -332,10 +407,12 @@ class AsyncTest(
         # order 2 then 1.
         loop = tornado.ioloop.IOLoop.instance()
 
+        cx = self.async_connection()
+
         # This find_one() takes half a second
         loop.add_timeout(
             time.time() + 0.1,
-            lambda: async.AsyncConnection().test.test_collection.find_one(
+            lambda: cx.test.test_collection.find_one(
                 {'_id': 1, '$where': delay(500)},
                 fields={'s': True, '_id': False},
                 callback=callback
@@ -345,7 +422,7 @@ class AsyncTest(
         # Very fast lookup
         loop.add_timeout(
             time.time() + 0.2,
-            lambda: async.AsyncConnection().test.test_collection.find_one(
+            lambda: cx.test.test_collection.find_one(
                 {'_id': 2},
                 fields={'s': True, '_id': False},
                 callback=callback
@@ -368,7 +445,7 @@ class AsyncTest(
                 raise error
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.update(
+        self.async_connection().test.test_collection.update(
             {'_id': 5},
             {'$set': {'foo': 'bar'}},
             callback=callback,
@@ -393,7 +470,7 @@ class AsyncTest(
             self.assertEqual(None, result)
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.update(
+        self.async_connection().test.test_collection.update(
             {'_id': 5},
             {'$set': {'s': hex(4)}}, # There's already a document with s: hex(4)
             callback=callback,
@@ -412,7 +489,7 @@ class AsyncTest(
                 raise error
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.insert(
+        self.async_connection().test.test_collection.insert(
             {'_id': 201},
             callback=callback,
         )
@@ -432,7 +509,7 @@ class AsyncTest(
                 raise error
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.insert(
+        self.async_connection().test.test_collection.insert(
             [{'_id': i, 's': hex(i)} for i in range(201, 211)],
             callback=callback,
         )
@@ -454,7 +531,7 @@ class AsyncTest(
             self.assertEqual(None, result)
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.insert(
+        self.async_connection().test.test_collection.insert(
             {'s': hex(4)}, # There's already a document with s: hex(4)
             callback=callback,
         )
@@ -475,7 +552,7 @@ class AsyncTest(
             self.assert_(isinstance(error, pymongo.errors.DuplicateKeyError))
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.insert(
+        self.async_connection().test.test_collection.insert(
             [
                 {'_id': 201, 's': hex(201)},
                 {'_id': 202, 's': hex(4)}, # Already exists
@@ -513,7 +590,7 @@ class AsyncTest(
                 raise error
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.save(
+        self.async_connection().test.test_collection.save(
             {'_id': 5},
             callback=callback,
         )
@@ -533,7 +610,7 @@ class AsyncTest(
                 raise error
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.save(
+        self.async_connection().test.test_collection.save(
             {'fiddle': 'faddle'},
             callback=callback,
         )
@@ -558,7 +635,7 @@ class AsyncTest(
             self.assertEqual(None, result)
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.save(
+        self.async_connection().test.test_collection.save(
             {'_id': 5, 's': hex(4)}, # There's already a document with s: hex(4)
             callback=callback,
         )
@@ -568,7 +645,7 @@ class AsyncTest(
         tornado.ioloop.IOLoop.instance().start()
         self.assertEqual(1, len(results))
 
-    def __test_save_multiple(self):
+    def test_save_multiple(self):
         """
         TODO: what are we testing here really?
         """
@@ -580,16 +657,19 @@ class AsyncTest(
                 raise error
             results.append(result)
 
-        loop = tornado.ioloop.IOLoop.instance()
+        cx = self.async_connection()
+
         for i in range(10):
-            async.AsyncConnection().test.test_collection.save(
+            cx.test.test_collection.save(
                 {'_id': i + 500, 's': hex(i + 500)},
                 callback=callback
             )
 
+        # Once all saves complete, results will be a list of _id's, from 500 to
+        # 509, but not necessarily in that order since we're async.
         self.assertEventuallyEqual(
             range(500, 510),
-            lambda: results
+            lambda: sorted(results)
         )
 
         tornado.ioloop.IOLoop.instance().start()
@@ -597,8 +677,8 @@ class AsyncTest(
 
     def test_remove(self):
         """
-        Remove a document twice, check that we get the proper response both
-        times.
+        Remove a document twice, check that we get a success response first time
+        and an error the second time.
         """
         results = []
         def callback(result, error):
@@ -606,14 +686,15 @@ class AsyncTest(
                 raise error
             results.append(result)
 
-        async.AsyncConnection().test.test_collection.remove(
+        cx = self.async_connection()
+        cx.test.test_collection.remove(
             {'_id': 1},
             callback=callback
         )
 
         tornado.ioloop.IOLoop.instance().add_timeout(
             0.1,
-            lambda: async.AsyncConnection().test.test_collection.remove(
+            lambda: cx.test.test_collection.remove(
                 {'_id': 1},
                 callback=callback
             )
@@ -636,7 +717,7 @@ class AsyncTest(
         """
         Test that unsafe inserts with no callback still work
         """
-        async.AsyncConnection().test.test_collection.insert({'_id': 201})
+        self.async_connection().test.test_collection.insert({'_id': 201})
 
         self.assertEventuallyEqual(
             1,
@@ -649,7 +730,7 @@ class AsyncTest(
         """
         Test that unsafe saves with no callback still work
         """
-        async.AsyncConnection().test.test_collection.save({'_id': 201})
+        self.async_connection().test.test_collection.save({'_id': 201})
 
         self.assertEventuallyEqual(
             1,
@@ -658,14 +739,23 @@ class AsyncTest(
 
         tornado.ioloop.IOLoop.instance().start()
 
+    def test_command(self):
+        assert False, "TODO"
+        self.admin.command("ismaster", callback=callback)
+
+
 # TODO: test that save and insert are async somehow? MongoDB's database-wide
 #     write lock makes this hard. Maybe with two mongod instances.
 # TODO: test master/slave, shard, replica set
-# TODO: test chaining: works if last chain has callback arg, error otherwise
 # TODO: replicate asyncmongo's whole test suite?
 # TODO: apply pymongo's whole suite to async
-# TODO: don't use the 'test' database, use something that will play nice w/ Bamboo
-
+# TODO: don't use the 'test' database, use something that will play nice w/
+#     Jenkins environment
+# TODO: test SSL, I don't think my call to ssl.wrap_socket() in AsyncSocket is
+#     right
+# TODO: check that sockets are returned to pool, or closed, or something
+# TODO: check that all cursors are closed!
+# TODO: test unsafe remove
 
 if __name__ == '__main__':
 #    import greenlet
