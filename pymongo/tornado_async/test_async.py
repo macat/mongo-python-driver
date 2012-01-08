@@ -21,6 +21,8 @@ import unittest
 import pymongo
 import pymongo.objectid
 from pymongo.tornado_async import async
+from pymongo.errors import ConnectionFailure, InvalidOperation
+
 import tornado.ioloop
 
 # Tornado testing tools
@@ -79,7 +81,7 @@ class AsyncTest(
         super(AsyncTest, self).tearDown()
 
     def test_repr(self):
-        cx = async.AsyncConnection()
+        cx = self.async_connection()
         self.assert_(repr(cx).startswith('AsyncConnection'))
         db = cx.test
         self.assert_(repr(db).startswith('AsyncDatabase'))
@@ -132,8 +134,6 @@ class AsyncTest(
         cursor = coll.find(callback=lambda: None)
         self.assert_(isinstance(cursor, async.AsyncCursor))
         self.assert_(cursor.started_async, "Cursor should start immediately")
-        cursor = coll.find()
-        self.assertFalse(isinstance(cursor, async.AsyncCursor))
 
     def test_find(self):
         results = []
@@ -740,9 +740,27 @@ class AsyncTest(
         tornado.ioloop.IOLoop.instance().start()
 
     def test_command(self):
-        assert False, "TODO"
-        self.admin.command("ismaster", callback=callback)
+        cx = self.async_connection()
+        results = []
 
+        self.assertRaises(
+            InvalidOperation,
+            lambda: cx.admin.command("buildinfo", check=True, callback=None)
+        )
+
+        def callback(result, error):
+            if error:
+                raise error
+            results.append(result)
+
+        cx.admin.command("buildinfo", callback=callback)
+
+        self.assertEventuallyEqual(
+            int,
+            lambda: type(results[0]['bits'])
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
 
 # TODO: test that save and insert are async somehow? MongoDB's database-wide
 #     write lock makes this hard. Maybe with two mongod instances.
@@ -756,6 +774,7 @@ class AsyncTest(
 # TODO: check that sockets are returned to pool, or closed, or something
 # TODO: check that all cursors are closed!
 # TODO: test unsafe remove
+# TODO: test deeply-nest callbacks
 
 if __name__ == '__main__':
 #    import greenlet

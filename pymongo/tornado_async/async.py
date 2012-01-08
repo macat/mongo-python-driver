@@ -26,8 +26,12 @@ import tornado.ioloop, tornado.iostream
 import greenlet
 import os
 
+from bson.binary import UUID_SUBTYPE
+from bson.son import SON
+
 import pymongo
 from pymongo.errors import ConnectionFailure, InvalidOperation
+from pymongo import common, helpers
 
 
 # TODO: sphinx-formatted docstrings
@@ -36,6 +40,8 @@ from pymongo.errors import ConnectionFailure, InvalidOperation
 #   find(). Making AsyncConnection.open() has made this possible I think.
 # TODO: AsyncCursor.__del__() kills cursor *asynchronously* if necessary;
 #   include a cursor count in all tests
+# TODO: callback should be optional for all -- not defaulted to None, but None
+#   is acceptable
 
 class AsyncSocket(object):
     """
@@ -50,7 +56,6 @@ class AsyncSocket(object):
         self.socket = sock
         self._stream = None
 
-    # Proxy some socket methods
     def setsockopt(self, *args, **kwargs):
         self.socket.setsockopt(*args, **kwargs)
 
@@ -137,7 +142,7 @@ class AsyncPool(object):
         self.pid = os.getpid()
         self.max_size = max_size
 
-        # TODO: how do connection and net timeouts work w/ non-blocking sockets?
+        # TODO: how do connection- and net-timeouts work w/ non-blocking sockets?
         self.net_timeout = net_timeout
         self.conn_timeout = conn_timeout
         self.use_ssl = use_ssl
@@ -165,7 +170,7 @@ class AsyncPool(object):
 
         if self.use_ssl:
             try:
-                # TODO: ugly
+                # TODO: ugly, probably wrong
                 async_sock.socket = ssl.wrap_socket(async_sock.socket)
             except ssl.SSLError:
                 async_sock.close()
@@ -183,6 +188,9 @@ class AsyncPool(object):
         # We use the pid here to avoid issues with fork / multiprocessing.
         # See test.test_connection:TestConnection.test_fork for an example of
         # what could go wrong otherwise
+
+        # TODO: comment above copied from official pymongo pool; does it apply
+        # to async? If not, can we delete all pid-management?
         pid = os.getpid()
 
         if pid != self.pid:
@@ -293,6 +301,49 @@ class AsyncDatabase(pymongo.database.Database):
         """
         return AsyncCollection(self, collection_name)
 
+    def command(self, command, value=1,
+                check=True, allowable_errors=[],
+                uuid_subtype=UUID_SUBTYPE, callback=None, **kwargs):
+        # TODO: What semantics exactly shall we support with check and callback?
+        #   Is check still necessary to support the pymongo API internally ... ?
+        if check and not callback:
+            raise InvalidOperation("Must pass a callback if check is True")
+
+        if isinstance(command, basestring):
+            command = SON([(command, value)])
+
+        use_master = kwargs.pop('_use_master', True)
+
+        fields = kwargs.get('fields')
+        if fields is not None and not isinstance(fields, dict):
+            kwargs['fields'] = helpers._fields_list_to_dict(fields)
+
+        command.update(kwargs)
+
+        def command_callback(result, error):
+            # TODO: what's the diff b/w getting an error here and getting one in
+            # _check_command_response?
+            if error:
+                if callback:
+                    callback(result, error)
+            elif check:
+                msg = "command %s failed: %%s" % repr(command).replace("%", "%%")
+                try:
+                    # TODO: test if disconnect() is called correctly
+                    helpers._check_command_response(result, self.connection.disconnect,
+                        msg, allowable_errors)
+
+                    # No exception thrown
+                    callback(result, error)
+                except Exception, e:
+                    callback(result, e)
+
+        self["$cmd"].find_one(command,
+                              _must_use_master=use_master,
+                              _is_command=True,
+                              _uuid_subtype=uuid_subtype,
+                              callback=callback)
+ 
     def __repr__(self):
         return 'Async' + super(AsyncDatabase, self).__repr__()
 
@@ -322,7 +373,8 @@ class AsyncCollection(pymongo.collection.Collection):
                 if 'callback' in kwargs:
                     kwargs = kwargs.copy()
                     del kwargs['callback']
-                    kwargs['safe'] = True
+
+                kwargs['safe'] = bool(client_callback)
 
                 def call_method():
                     assert greenlet.getcurrent().parent, (
@@ -352,8 +404,6 @@ class AsyncCollection(pymongo.collection.Collection):
             raise TypeError("cannot save object of type %s" % type(to_save))
 
         if "_id" not in to_save:
-            # This could be a synchronous or async operation, depending on
-            # whether a callback is in kwargs.
             return self.insert(to_save, manipulate, safe=safe, **kwargs)
         else:
             client_callback = kwargs.get('callback')
@@ -381,62 +431,43 @@ class AsyncCollection(pymongo.collection.Collection):
 
     def find(self, *args, **kwargs):
         """
-        If passed a callback, run an async find(), and return an AsyncCursor,
-        rather than returning a pymongo Cursor for synchronous operations.
+        Run an async find(), and return an AsyncCursor, rather than returning a
+        pymongo Cursor for synchronous operations.
         """
         client_callback = kwargs.get('callback')
-        if not client_callback:
-            # Synchronous operation
-            return super(AsyncCollection, self).find(*args, **kwargs)
-        else:
-            if not callable(client_callback):
-                raise TypeError("callback must be callable")
+        kwargs = kwargs.copy()
+        del kwargs['callback']
 
-            kwargs = kwargs.copy()
-            del kwargs['callback']
+        cursor = super(AsyncCollection, self).find(*args, **kwargs)
+        async_cursor = AsyncCursor(cursor)
+        async_cursor.get_more(client_callback)
 
-            cursor = super(AsyncCollection, self).find(*args, **kwargs)
-            async_cursor = AsyncCursor(cursor)
-
-            def get_first_batch():
-                result, error = async_cursor.get_batch()
-                tornado.ioloop.IOLoop.instance().add_callback(
-                    lambda: client_callback(result, error)
-                )
-
-            # Start running find() in the greenlet
-            greenlet.greenlet(get_first_batch).switch()
-
-            # When the greenlet has sent the query on the socket, it will switch
-            # back to the main greenlet, here, and we return to the caller.
-            return async_cursor
+        # When the greenlet has sent the query on the socket, it will switch
+        # back to the main greenlet, here, and we return to the caller.
+        return async_cursor
 
     def find_one(self, *args, **kwargs):
         client_callback = kwargs.get('callback')
-        if not client_callback:
-            # Synchronous operation
-            return super(AsyncCollection, self).find_one(*args, **kwargs)
-        else:
-            if not callable(client_callback):
-                raise TypeError("callback must be callable")
-            # We're going to pass limit of -1 to tell the server we're doing a
-            # findOne, so ensure limit isn't already in kwargs.
-            if 'limit' in kwargs:
-                raise TypeError("'limit' argument not allowed for find_one")
+        if not callable(client_callback):
+            raise TypeError("callback must be callable")
 
-            kwargs = kwargs.copy()
-            del kwargs['callback']
+        if 'limit' in kwargs:
+            raise TypeError("'limit' argument not allowed for find_one")
 
-            def find_one_callback(result, error):
-                # Turn single-document list into a plain document
-                assert result is None or len(result) == 1, (
-                    "Got %d results from a findOne" % len(result)
-                )
+        kwargs = kwargs.copy()
+        del kwargs['callback']
 
-                client_callback(result[0] if result else None, error)
+        def find_one_callback(result, error):
+            # Turn single-document list into a plain document.
+            # This is run on the main greenlet.
+            assert result is None or len(result) == 1, (
+                "Got %d results from a findOne" % len(result)
+            )
 
-            # TODO: python2.4-compatible?
-            self.find(*args, limit=-1, callback=find_one_callback, **kwargs)
+            client_callback(result[0] if result else None, error)
+
+        # TODO: python2.4-compatible?
+        self.find(*args, limit=-1, callback=find_one_callback, **kwargs)
 
     def __repr__(self):
         return 'Async' + super(AsyncCollection, self).__repr__()
@@ -450,43 +481,34 @@ class AsyncCursor(object):
         self.__sync_cursor = cursor
         self.started_async = False
 
-    def get_batch(self):
-        """
-        Call this on a child greenlet. Returns (result, error).
-        """
-        assert greenlet.getcurrent().parent, "Should be on child greenlet"
-        result, error = None, None
-        try:
-            self.started_async = True
-            self.__sync_cursor._refresh()
-
-            # TODO: Make this accessible w/o underscore hack
-            result = self.__sync_cursor._Cursor__data
-            self.__sync_cursor._Cursor__data = []
-        except Exception, e:
-            error = e
-
-        return result, error
-
     def get_more(self, callback):
         """
-        Get next batch of data asynchronously.
+        Get a batch of data asynchronously, either performing an initial query or
+        getting more data from an existing cursor.
         @param callback:    A function taking parameters (result, error)
         """
-        assert self.started_async, (
-            "get_more() called on cursor before it has started"
-        )
+        if not callable(callback):
+            raise TypeError("callback must be callable")
 
-        def next_batch():
+        def _get_more():
             # This is executed on child greenlet
-            result, error = self.get_batch()
+            result, error = None, None
+            try:
+                self.started_async = True
+                self.__sync_cursor._refresh()
+
+                # TODO: Make this accessible w/o underscore hack
+                result = self.__sync_cursor._Cursor__data
+                self.__sync_cursor._Cursor__data = []
+            except Exception, e:
+                error = e
 
             # Execute callback on main greenlet
             tornado.ioloop.IOLoop.instance().add_callback(
                 lambda: callback(result, error)
             )
 
-        greenlet.greenlet(next_batch).switch()
+        greenlet.greenlet(_get_more).switch()
 
         # When the greenlet has sent the query on the socket, it will switch
         # back to the main greenlet, here, and we return to the caller.
@@ -501,6 +523,9 @@ class AsyncCursor(object):
         """
         Support the chaining operators on cursors like limit() and batch_size()
         """
+        # TODO: either implement chaining or delete this method
+        raise NotImplementedError(name)
+    
         if name in (
             'add_option', 'remove_option', 'limit', 'batch_size', 'skip',
             'max_scan', 'sort', 'count', 'distinct', 'hint', 'where', 'explain'
