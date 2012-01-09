@@ -14,6 +14,7 @@
 
 """Test the Tornado asynchronous Python driver for MongoDB."""
 
+import functools
 import sys
 import time
 import unittest
@@ -27,6 +28,8 @@ import tornado.ioloop
 
 # Tornado testing tools
 from pymongo.tornado_async import eventually, puritanical
+
+# TODO: sphinx-compat?
 
 def delay(ms):
     """
@@ -76,10 +79,28 @@ class AsyncTest(
         assert cx.connected, "Couldn't connect to MongoDB"
         return cx
 
+    def check_callback_handling(self, fn, required=False):
+        """
+        Take a function and verify that it accepts a 'callback' parameter
+        and properly type-checks it. If 'required', check that fn requires
+        a callback.
+        """
+        self.assertRaises(TypeError, lambda: fn(callback='foo'))       
+        self.assertRaises(TypeError, lambda: fn(callback=1))
+
+        if required:
+            self.assertRaises(TypeError, lambda: fn())
+        else:        
+            # Should not raise
+            fn(callback=None)
+
+        # Should not raise
+        fn(callback=lambda: None)                          
+
     def tearDown(self):
         self.sync_coll.remove()
         super(AsyncTest, self).tearDown()
-
+        
     def test_repr(self):
         cx = self.async_connection()
         self.assert_(repr(cx).startswith('AsyncConnection'))
@@ -99,7 +120,7 @@ class AsyncTest(
 
         self.assertRaises(
             pymongo.errors.InvalidOperation,
-            lambda: cx.some_database_name
+            lambda: cx['some_database_name']
         )
 
         called = {'callback': False}
@@ -123,6 +144,10 @@ class AsyncTest(
 
         tornado.ioloop.IOLoop.instance().start()
 
+    def test_connection_callback(self):
+        cx = async.AsyncConnection()
+        self.check_callback_handling(cx.open)
+        
     def test_cursor(self):
         """
         Test that we get a regular Cursor if we don't pass a callback to find(),
@@ -165,6 +190,10 @@ class AsyncTest(
 
         tornado.ioloop.IOLoop.instance().start()
 
+    def test_find_callback(self):
+        cx = self.async_connection()
+        self.check_callback_handling(cx.test.test_collection.find, required=True)
+        
     def test_find_default_batch(self):
         results = []
         cursor = None
@@ -390,6 +419,13 @@ class AsyncTest(
 
         tornado.ioloop.IOLoop.instance().start()
 
+    def test_find_one_callback(self):
+        cx = self.async_connection()
+        self.check_callback_handling(
+            cx.test.test_collection.find_one,
+            required=True
+        )
+
     def test_find_one_is_async(self):
         """
         Confirm find_one() is async by launching two operations which will
@@ -437,6 +473,11 @@ class AsyncTest(
 
         tornado.ioloop.IOLoop.instance().start()
 
+    def test_get_more_callback(self):
+        cx = self.async_connection()
+        cursor = cx.test.test_collection.find(callback=lambda: None)
+        self.check_callback_handling(cursor.get_more, required=True)
+
     def test_update(self):
         results = []
 
@@ -479,6 +520,12 @@ class AsyncTest(
         self.assertEventuallyEqual(None, lambda: results[0])
         tornado.ioloop.IOLoop.instance().start()
         self.assertEqual(1, len(results))
+
+    def test_update_callback(self):
+        cx = self.async_connection()
+        self.check_callback_handling(
+            functools.partial(cx.test.test_collection.update, {}, {})
+        )
 
     def test_insert(self):
         results = []
@@ -579,6 +626,12 @@ class AsyncTest(
         self.assertEqual(
             [],
             list(self.sync_db.test_collection.find({'_id': 203}))
+        )
+
+    def test_save_callback(self):
+        cx = self.async_connection()
+        self.check_callback_handling(
+            functools.partial(cx.test.test_collection.save, {})
         )
 
     def test_save_with_id(self):
@@ -713,6 +766,12 @@ class AsyncTest(
         tornado.ioloop.IOLoop.instance().start()
         self.assertEqual(2, len(results))
 
+    def test_remove_callback(self):
+        cx = self.async_connection()
+        self.check_callback_handling(
+            functools.partial(cx.test.test_collection.remove, {})
+        )
+
     def test_unsafe_insert(self):
         """
         Test that unsafe inserts with no callback still work
@@ -761,6 +820,18 @@ class AsyncTest(
         )
 
         tornado.ioloop.IOLoop.instance().start()
+
+    def test_command_callback(self):
+        cx = self.async_connection()
+        self.check_callback_handling(
+            functools.partial(cx.admin.command, 'buildinfo', check=False)
+        )
+
+        self.assertRaises(
+            InvalidOperation,
+            lambda: cx.admin.command('buildinfo', check=True, callback=None)
+        )
+
 
 # TODO: test that save and insert are async somehow? MongoDB's database-wide
 #     write lock makes this hard. Maybe with two mongod instances.

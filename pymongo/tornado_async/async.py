@@ -33,15 +33,17 @@ import pymongo
 from pymongo.errors import ConnectionFailure, InvalidOperation
 from pymongo import common, helpers
 
+__all__ = ['AsyncConnection']
 
 # TODO: sphinx-formatted docstrings
-# TODO: simplify by removing the sync / async if callback logic, all commands
-#   on Async* classes must be async, must have callback if expect result like
-#   find(). Making AsyncConnection.open() has made this possible I think.
 # TODO: AsyncCursor.__del__() kills cursor *asynchronously* if necessary;
 #   include a cursor count in all tests
-# TODO: callback should be optional for all -- not defaulted to None, but None
-#   is acceptable
+
+def check_callable(kallable, required=False):
+    if required and not kallable:
+        raise TypeError("callable is required")
+    if kallable is not None and not callable(kallable):
+        raise TypeError("callback must be callable")
 
 class AsyncSocket(object):
     """
@@ -233,6 +235,8 @@ class AsyncConnection(object):
         Actually connect, passing self to a callback when connected.
         @param callback: Optional function taking parameters (connection, error)
         """
+        check_callable(callback)
+        
         def connect():
             # Run on child greenlet
             error = None
@@ -283,7 +287,18 @@ class AsyncConnection(object):
                 " connect()"
             )
         return AsyncDatabase(self.sync_connection, name)
+    
+    def __getitem__(self, name):
+        """Get a database by name.
 
+        Raises :class:`~pymongo.errors.InvalidName` if an invalid
+        database name is used.
+
+        :Parameters:
+          - `name`: the name of the database to get
+        """
+        return self.__getattr__(name)
+    
     def __repr__(self):
         return 'AsyncConnection(%s)' % (
             ','.join([
@@ -308,6 +323,8 @@ class AsyncDatabase(pymongo.database.Database):
         #   Is check still necessary to support the pymongo API internally ... ?
         if check and not callback:
             raise InvalidOperation("Must pass a callback if check is True")
+
+        check_callable(callback)
 
         if isinstance(command, basestring):
             command = SON([(command, value)])
@@ -342,7 +359,7 @@ class AsyncDatabase(pymongo.database.Database):
                               _must_use_master=use_master,
                               _is_command=True,
                               _uuid_subtype=uuid_subtype,
-                              callback=callback)
+                              callback=command_callback)
  
     def __repr__(self):
         return 'Async' + super(AsyncDatabase, self).__repr__()
@@ -367,8 +384,7 @@ class AsyncCollection(pymongo.collection.Collection):
         else:
             def method(*args, **kwargs):
                 client_callback = kwargs.get('callback')
-                if client_callback and not callable(client_callback):
-                    raise TypeError("callback must be callable")
+                check_callable(client_callback)
 
                 if 'callback' in kwargs:
                     kwargs = kwargs.copy()
@@ -407,13 +423,12 @@ class AsyncCollection(pymongo.collection.Collection):
             return self.insert(to_save, manipulate, safe=safe, **kwargs)
         else:
             client_callback = kwargs.get('callback')
-            if client_callback:
-                if not callable(client_callback):
-                    raise TypeError("callback must be callable")
-
+            check_callable(client_callback)
+            if 'callback' in kwargs:
                 kwargs = kwargs.copy()
                 del kwargs['callback']
 
+            if client_callback:
                 # update() calls the callback with server's response to
                 # getLastError, but we want to call it with the _id of the
                 # saved document.
@@ -435,6 +450,7 @@ class AsyncCollection(pymongo.collection.Collection):
         pymongo Cursor for synchronous operations.
         """
         client_callback = kwargs.get('callback')
+        check_callable(client_callback, required=True)
         kwargs = kwargs.copy()
         del kwargs['callback']
 
@@ -448,14 +464,14 @@ class AsyncCollection(pymongo.collection.Collection):
 
     def find_one(self, *args, **kwargs):
         client_callback = kwargs.get('callback')
-        if not callable(client_callback):
-            raise TypeError("callback must be callable")
+        check_callable(client_callback, required=True)
+        
+        if 'callback' in kwargs:
+            kwargs = kwargs.copy()
+            del kwargs['callback']
 
         if 'limit' in kwargs:
             raise TypeError("'limit' argument not allowed for find_one")
-
-        kwargs = kwargs.copy()
-        del kwargs['callback']
 
         def find_one_callback(result, error):
             # Turn single-document list into a plain document.
@@ -485,10 +501,9 @@ class AsyncCursor(object):
         """
         Get a batch of data asynchronously, either performing an initial query or
         getting more data from an existing cursor.
-        @param callback:    A function taking parameters (result, error)
+        @param callback:    Optional function taking parameters (result, error)
         """
-        if not callable(callback):
-            raise TypeError("callback must be callable")
+        check_callable(callback)
 
         def _get_more():
             # This is executed on child greenlet
@@ -539,10 +554,8 @@ class AsyncCursor(object):
                     )
 
                 client_callback = kwargs.get('callback')
-                if client_callback:
-                    if not callable(client_callback):
-                        raise TypeError("callback must be callable")
-
+                check_callable(client_callback)
+                if 'callback' in kwargs:
                     kwargs = kwargs.copy()
                     del kwargs['callback']
 
