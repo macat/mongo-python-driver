@@ -65,6 +65,12 @@ class AsyncTest(
             safe=True
         )
 
+        self.open_cursors = self.get_open_cursors()
+
+    def get_open_cursors(self):
+        output = self.sync_cx.admin.command('serverStatus')
+        return output.get('cursors', {}).get('totalOpen')
+
     def async_connection(self):
         cx = async.AsyncConnection()
         loop = tornado.ioloop.IOLoop.instance()
@@ -99,6 +105,16 @@ class AsyncTest(
 
     def tearDown(self):
         self.sync_coll.remove()
+
+        actual_open_cursors = self.get_open_cursors()
+        self.assertEqual(
+            self.open_cursors,
+            actual_open_cursors,
+            "%d open cursors at start of test, %d at end, should be equal" % (
+                self.open_cursors, actual_open_cursors
+            )
+        )
+
         super(AsyncTest, self).tearDown()
         
     def test_repr(self):
@@ -164,35 +180,83 @@ class AsyncTest(
         results = []
 
         # Although in most tests I'm using the synchronized
-        # self.async_connection() for convienience, here I'll really test
+        # self.async_connection() for convenience, here I'll really test
         # passing a callback to open() that does a find(), just to make sure
-        # that works in the Node.js-driver style.
+        # that works in the Christian Kvalheim Node.js-driver style.
         def connected(connection, error):
             if error:
                 raise error
 
-            connection.test.test_collection.find(
-                {'_id': 1},
-                callback=found
+            def found(result, error):
+                if error:
+                    raise error
+
+                # 'cursor' should still be open
+                self.assertEqual(
+                    1 + self.open_cursors,
+                    self.get_open_cursors()
+                )
+
+                results.append(result)
+
+                cursor.get_more(got_more)
+
+            def got_more(result, error):
+                if error:
+                    raise error
+
+                results.append(result)
+                if len(results) == 3:
+                    # cursor should be closed by now
+                    expected_cursors = self.open_cursors
+                else:
+                    expected_cursors = self.open_cursors + 1
+
+                actual_open_cursors = self.get_open_cursors()
+
+                self.assertEqual(
+                    expected_cursors,
+                    actual_open_cursors,
+                    "Expected %d open cursors when there are %d batches"
+                    " of results, found %d" % (
+                        expected_cursors, len(results), actual_open_cursors
+                    )
+                )
+
+                # Get next batch
+                if cursor.alive:
+                    cursor.get_more(got_more)
+                else:
+                    self.assertRaises(
+                        InvalidOperation,
+                        lambda: cursor.get_more(got_more)
+                    )
+
+            cursor = connection.test.test_collection.find(
+                {},
+                {'s': False}, # exclude 's' field
+                callback=found,
+                sort=[('_id', 1)],
+                batch_size=75 # results in 3 batches since there are 200 docs
             )
 
-        def found(result, error):
-            if error:
-                raise error
-            results.append(result)
+        async.AsyncConnection().open(callback=connected)
 
         self.assertEventuallyEqual(
-            [{'_id': 1, 's': hex(1)}],
-            lambda: results[0]
+            [
+                [{'_id': i} for i in range(j, min(j + 75, 200))]
+                for j in range(0, 200, 75)
+            ],
+            lambda: results
         )
-
-        async.AsyncConnection().open(callback=connected)
 
         tornado.ioloop.IOLoop.instance().start()
 
     def test_find_callback(self):
         cx = self.async_connection()
-        self.check_callback_handling(cx.test.test_collection.find, required=True)
+        self.check_callback_handling(
+            cx.test.test_collection.find, required=True
+        )
         
     def test_find_default_batch(self):
         results = []
@@ -473,10 +537,40 @@ class AsyncTest(
 
         tornado.ioloop.IOLoop.instance().start()
 
+    def test_cursor_close(self):
+        cx = self.async_connection()
+        loop = tornado.ioloop.IOLoop.instance()
+
+        def found(result, error):
+            if error:
+                raise error
+
+            loop.stop()
+
+        cursor = cx.test.test_collection.find(callback=found)
+
+        # Start the cursor
+        loop.start()
+
+        cursor.close()
+
     def test_get_more_callback(self):
         cx = self.async_connection()
-        cursor = cx.test.test_collection.find(callback=lambda: None)
+        loop = tornado.ioloop.IOLoop.instance()
+
+        def found(result, error):
+            if error:
+                raise error
+
+            loop.stop()
+
+        cursor = cx.test.test_collection.find(callback=found)
+
+        # Start the cursor so we can correctly call get_more()
+        loop.start()
+
         self.check_callback_handling(cursor.get_more, required=True)
+        cursor.close()
 
     def test_update(self):
         results = []

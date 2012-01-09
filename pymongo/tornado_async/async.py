@@ -36,8 +36,6 @@ from pymongo import common, helpers
 __all__ = ['AsyncConnection']
 
 # TODO: sphinx-formatted docstrings
-# TODO: AsyncCursor.__del__() kills cursor *asynchronously* if necessary;
-#   include a cursor count in all tests
 
 def check_callable(kallable, required=False):
     if required and not kallable:
@@ -492,18 +490,24 @@ class AsyncCollection(pymongo.collection.Collection):
 class AsyncCursor(object):
     def __init__(self, cursor):
         """
-        @param cursor:  Synchronous pymongo cursor
+        @param cursor:  Synchronous pymongo.Cursor
         """
         self.__sync_cursor = cursor
         self.started_async = False
 
     def get_more(self, callback):
         """
-        Get a batch of data asynchronously, either performing an initial query or
-        getting more data from an existing cursor.
+        Get a batch of data asynchronously, either performing an initial query
+        or getting more data from an existing cursor.
         @param callback:    Optional function taking parameters (result, error)
         """
         check_callable(callback)
+        assert not self.__sync_cursor._Cursor__killed
+        if self.started_async and not self.alive:
+            raise InvalidOperation(
+                "Can't call get_more() on an AsyncCursor that has been"
+                " exhausted or killed."
+            )
 
         def _get_more():
             # This is executed on child greenlet
@@ -532,7 +536,12 @@ class AsyncCursor(object):
     @property
     def alive(self):
         """Does this cursor have the potential to return more data?"""
-        return self.__sync_cursor.alive
+        return self.__sync_cursor.alive and self.__sync_cursor._Cursor__id
+
+    def close(self):
+        """Explicitly close this cursor.
+        """
+        self.__sync_cursor.close()
 
     def __getattr__(self, name):
         """
