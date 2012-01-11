@@ -541,7 +541,7 @@ class AsyncCursor(object):
     def close(self):
         """Explicitly close this cursor.
         """
-        self.__sync_cursor.close()
+        greenlet.greenlet(self.__sync_cursor.close).switch()
 
     def __getattr__(self, name):
         """

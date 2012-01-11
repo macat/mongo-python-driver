@@ -15,14 +15,13 @@
 """Test the Tornado asynchronous Python driver for MongoDB."""
 
 import functools
-import sys
 import time
 import unittest
 
 import pymongo
 import pymongo.objectid
 from pymongo.tornado_async import async
-from pymongo.errors import ConnectionFailure, InvalidOperation
+from pymongo.errors import InvalidOperation
 
 import tornado.ioloop
 
@@ -101,7 +100,7 @@ class AsyncTest(
             fn(callback=None)
 
         # Should not raise
-        fn(callback=lambda: None)                          
+        fn(callback=lambda result, error: None)
 
     def tearDown(self):
         self.sync_coll.remove()
@@ -165,10 +164,6 @@ class AsyncTest(
         self.check_callback_handling(cx.open)
         
     def test_cursor(self):
-        """
-        Test that we get a regular Cursor if we don't pass a callback to find(),
-        and we get an AsyncCursor if we do pass a callback.
-        """
         cx = self.async_connection()
         coll = cx.test.foo
         # We're not actually running the find(), so null callback is ok
@@ -538,6 +533,15 @@ class AsyncTest(
         tornado.ioloop.IOLoop.instance().start()
 
     def test_cursor_close(self):
+        """
+        The flow here is complex; we're testing that a cursor can be explicitly
+        closed.
+        1. Create a cursor on the server by running find()
+        2. In the find() callback, start closing the cursor
+        3. Wait a little to make sure the cursor closes
+        4. Stop the IOLoop so we can exit test_cursor_close()
+        5. In AsyncTest.tearDown(), we'll assert all cursors have closed.
+        """
         cx = self.async_connection()
         loop = tornado.ioloop.IOLoop.instance()
 
@@ -545,14 +549,13 @@ class AsyncTest(
             if error:
                 raise error
 
-            loop.stop()
+            cursor.close()
+            loop.add_timeout(time.time() + .1, loop.stop)
 
         cursor = cx.test.test_collection.find(callback=found)
 
-        # Start the cursor
+        # Start the find(), the callback will close the cursor
         loop.start()
-
-        cursor.close()
 
     def test_get_more_callback(self):
         cx = self.async_connection()
@@ -562,15 +565,14 @@ class AsyncTest(
             if error:
                 raise error
 
-            loop.stop()
+            self.check_callback_handling(cursor.get_more, required=True)
+            cursor.close()
+            loop.add_timeout(time.time() + .1, loop.stop)
 
         cursor = cx.test.test_collection.find(callback=found)
 
         # Start the cursor so we can correctly call get_more()
         loop.start()
-
-        self.check_callback_handling(cursor.get_more, required=True)
-        cursor.close()
 
     def test_update(self):
         results = []
