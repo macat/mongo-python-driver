@@ -134,6 +134,9 @@ class AsyncSocket(object):
     def close(self):
         self.stream.close()
 
+    def __del__(self):
+        self.close()
+
 class AsyncPool(object):
     """A simple connection pool of AsyncSockets.
     """
@@ -199,6 +202,7 @@ class AsyncPool(object):
 
         try:
             sock = (pid, self.sockets.pop())
+            assert False, "I don't expect async to reuse sockets yet"
             return (sock[1], True)
         except IndexError:
             sock = (pid, self.connect(host, port))

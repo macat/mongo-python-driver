@@ -18,10 +18,20 @@ import functools
 import time
 import unittest
 
+from nose.plugins.skip import SkipTest
+import sys
+
+have_ssl = True
+try:
+    import ssl
+except ImportError:
+    have_ssl = False
+
 import pymongo
 import pymongo.objectid
 from pymongo.tornado_async import async
-from pymongo.errors import InvalidOperation
+from pymongo.errors import InvalidOperation, ConfigurationError, \
+    ConnectionFailure
 
 import tornado.ioloop
 
@@ -90,12 +100,12 @@ class AsyncTest(
         and properly type-checks it. If 'required', check that fn requires
         a callback.
         """
-        self.assertRaises(TypeError, lambda: fn(callback='foo'))       
-        self.assertRaises(TypeError, lambda: fn(callback=1))
+        self.assertRaises(TypeError, fn, callback='foo')
+        self.assertRaises(TypeError, fn, callback=1)
 
         if required:
-            self.assertRaises(TypeError, lambda: fn())
-        else:        
+            self.assertRaises(TypeError, fn)
+        else:
             # Should not raise
             fn(callback=None)
 
@@ -115,7 +125,9 @@ class AsyncTest(
         )
 
         super(AsyncTest, self).tearDown()
-        
+
+
+class AsyncTestBasic(AsyncTest):
     def test_repr(self):
         cx = self.async_connection()
         self.assert_(repr(cx).startswith('AsyncConnection'))
@@ -868,6 +880,25 @@ class AsyncTest(
             functools.partial(cx.test.test_collection.remove, {})
         )
 
+    def test_unsafe_remove(self):
+        """
+        Test that unsafe removes with no callback still work
+        """
+        self.assertEqual(
+            1,
+            self.sync_coll.find({'_id': 117}).count(),
+            "Test setup should have a document with _id 117"
+        )
+
+        self.async_connection().test.test_collection.remove({'_id': 117})
+
+        self.assertEventuallyEqual(
+            0,
+            lambda: len(list(self.sync_db.test_collection.find({'_id': 117})))
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
+        
     def test_unsafe_insert(self):
         """
         Test that unsafe inserts with no callback still work
@@ -928,6 +959,116 @@ class AsyncTest(
             lambda: cx.admin.command('buildinfo', check=True, callback=None)
         )
 
+    def test_nested_callbacks(self):
+        cx = self.async_connection()
+        results = [0]
+
+        def callback(result, error):
+            if error:
+                raise error
+
+            results[0] += 1
+            if results[0] < 1000:
+                cx.test.test_collection.find(
+                    {'_id': 1},
+                    {'s': False},
+                    callback=callback
+                )
+
+        cx.test.test_collection.find(
+            {'_id': 1},
+            {'s': False},
+            callback=callback
+        )
+
+        self.assertEventuallyEqual(
+            [1000],
+            lambda: results,
+            timeout_sec=30
+        )
+
+        tornado.ioloop.IOLoop.instance().start()
+
+    def test_nested_callbacks_2(self):
+        loop = tornado.ioloop.IOLoop.instance()
+        cx = async.AsyncConnection()
+        results = []
+
+        def connected(cx, error):
+            if error:
+                raise error
+
+            cx.pymongo_ssl_test.test.insert({'_id': 201}, callback=inserted)
+
+        def inserted(result, error):
+            if error:
+                raise error
+
+            cx.pymongo_ssl_test.test.find_one({'_id': 201}, callback=found)
+
+        def found(result, error):
+            if error:
+                raise error
+
+            cx.pymongo_ssl_test.test.remove({'_id': 201}, callback=removed)
+
+        def removed(result, error):
+            results.append('done')
+
+        cx.open(connected)
+
+        self.assertEventuallyEqual(
+            ['done'],
+            lambda: results
+        )
+
+        loop.start()
+
+
+class AsyncSSLTest(AsyncTest):
+    def test_no_ssl(self):
+        if have_ssl:
+            raise SkipTest(
+                "We have SSL compiled into Python, can't test what happens "
+                "without SSL"
+            )
+
+        self.assertRaises(ConfigurationError,
+            async.AsyncConnection, ssl=True)
+#        self.assertRaises(ConfigurationError,
+#            ReplicaSetConnection, ssl=True)
+
+    def test_simple_ops(self):
+        """
+        TODO: this is duplicative of test_nested_callbacks_2
+        """
+        if not have_ssl:
+            raise SkipTest()
+
+        loop = tornado.ioloop.IOLoop.instance()
+        cx = async.AsyncConnection(connectTimeoutMS=100, ssl=True)
+
+        def connected(cx, error):
+            if error:
+                raise error
+
+            cx.pymongo_ssl_test.test.insert({'ssl': True}, callback=inserted)
+
+        def inserted(result, error):
+            if error:
+                raise error
+
+            cx.pymongo_ssl_test.test.find_one(callback=found)
+
+        def found(result, error):
+            if error:
+                raise error
+
+            loop.stop()
+            cx.drop_database('pymongo_ssl_test')
+
+        cx.open(connected)
+        loop.start()
 
 # TODO: test that save and insert are async somehow? MongoDB's database-wide
 #     write lock makes this hard. Maybe with two mongod instances.
@@ -939,9 +1080,8 @@ class AsyncTest(
 # TODO: test SSL, I don't think my call to ssl.wrap_socket() in AsyncSocket is
 #     right
 # TODO: check that sockets are returned to pool, or closed, or something
-# TODO: check that all cursors are closed!
 # TODO: test unsafe remove
-# TODO: test deeply-nest callbacks
+# TODO: test deeply-nested callbacks
 
 if __name__ == '__main__':
 #    import greenlet
