@@ -25,6 +25,7 @@ except ImportError:
 import tornado.ioloop, tornado.iostream
 import greenlet
 import os
+import sys
 
 from bson.binary import UUID_SUBTYPE
 from bson.son import SON
@@ -150,6 +151,7 @@ class AsyncPool(object):
         self.conn_timeout = conn_timeout
         self.use_ssl = use_ssl
         self.sockets = []
+        self.greenlet2socket = {}
 
     def connect(self, host, port):
         """Connect to Mongo and return a new connected socket.
@@ -182,7 +184,6 @@ class AsyncPool(object):
 
         return async_sock
 
-
     def get_socket(self, host, port):
         # Unlike pymongo.Pool's get_socket(), we give out a socket here to
         # which the caller has exclusive access until it closes the socket or
@@ -197,30 +198,41 @@ class AsyncPool(object):
         pid = os.getpid()
 
         if pid != self.pid:
+            # TODO: refactor this into a function, __reset(), that's called from
+            # init
             self.sockets = []
+            self.greenlet2socket = {}
             self.pid = pid
 
         try:
             sock = (pid, self.sockets.pop())
-            assert False, "I don't expect async to reuse sockets yet"
+            print >> sys.stderr, 'reusing', sock, 'on greenlet', greenlet.getcurrent()
+            self.greenlet2socket[greenlet.getcurrent()] = sock
             return (sock[1], True)
         except IndexError:
             sock = (pid, self.connect(host, port))
+            self.greenlet2socket[greenlet.getcurrent()] = sock
             return (sock[1], False)
 
-    def return_socket(self, sock):
+    def return_socket(self):
         # TODO: what if a socket created in a parent process is returned here
         # after a fork?
-        #if self.sock is not None and self.sock[0] == os.getpid():
+        # TODO: also, what about multithreading PLUS greenlets? are we thread-
+        # safe here?
+        gr = greenlet.getcurrent()
+        assert gr.parent, "Should be on child greenlet?"
 
-        # There's a race condition here, but we deliberately
-        # ignore it.  It means that if the pool_size is 10 we
-        # might actually keep slightly more than that.
-        if len(self.sockets) < self.max_size:
-            self.sockets.append(sock)
+        sock = self.greenlet2socket.get(gr)
+        if sock:
+            # There's a race condition here, but we deliberately
+            # ignore it.  It means that if the pool_size is 10 we
+            # might actually keep slightly more than that.
+            if len(self.sockets) < self.max_size:
+                self.sockets.append(sock)
+            else:
+                sock.close()
         else:
-            sock.close()
-
+            print >> sys.stderr, "return_socket() called on", gr, "without associated socket"
 
 class AsyncConnection(object):
     def __init__(self, *args, **kwargs):
@@ -245,6 +257,7 @@ class AsyncConnection(object):
             try:
                 cx = self.sync_connection = pymongo.Connection(
                     *self.__init_args,
+                    pool_class=AsyncPool,
                     **self.__init_kwargs
                 )
                 
