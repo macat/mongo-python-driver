@@ -89,7 +89,7 @@ class GreenletTest(unittest.TestCase):
         Antonin Amand @gwik <antonin.amand@gmail.com>
         """
         from gevent import monkey; monkey.patch_socket()
-        official_pool = pymongo.connection._Pool
+        official_pool = pymongo.pool.Pool
         geventmongo.patch() # Replaces _Pool with a gevent-safe pool
         try:
             self._test_greenlet()

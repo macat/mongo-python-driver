@@ -316,7 +316,7 @@ class ReplicaSetConnection(common.BaseObject):
         elif db_name in self.__auth_credentials:
             del self.__auth_credentials[db_name]
 
-    def __check_auth(self, sock, authset):
+    def __check_auth(self, sock_info):
         """Authenticate using cached database credentials.
 
         If credentials for the 'admin' database are available only
@@ -325,28 +325,28 @@ class ReplicaSetConnection(common.BaseObject):
         names = set(self.__auth_credentials.iterkeys())
 
         # Logout from any databases no longer listed in the credentials cache.
-        for dbname in authset - names:
+        for dbname in sock_info.authset - names:
             try:
-                self.__simple_command(sock, dbname, {'logout': 1})
+                self.__simple_command(sock_info.sock, dbname, {'logout': 1})
             # TODO: We used this socket to logout. Fix logout so we don't
             # have to catch this.
             except OperationFailure:
                 pass
-            authset.discard(dbname)
+            sock_info.authset.discard(dbname)
 
         # Once logged into the admin database we can access anything.
-        if "admin" in authset:
+        if "admin" in sock_info.authset:
             return
 
         if "admin" in self.__auth_credentials:
             username, password = self.__auth_credentials["admin"]
-            self.__auth(sock, 'admin', username, password)
-            authset.add('admin')
+            self.__auth(sock_info.sock, 'admin', username, password)
+            sock_info.authset.add('admin')
         else:
-            for db_name in names - authset:
+            for db_name in names - sock_info.authset:
                 user, pwd = self.__auth_credentials[db_name]
-                self.__auth(sock, db_name, user, pwd)
-                authset.add(db_name)
+                self.__auth(sock_info.sock, db_name, user, pwd)
+                sock_info.authset.add(db_name)
 
     @property
     def seeds(self):
@@ -444,11 +444,12 @@ class ReplicaSetConnection(common.BaseObject):
     def __is_master(self, host):
         """Directly call ismaster.
         """
-        mongo = pool.Pool(host, self.__max_pool_size,
-                          self.__net_timeout, self.__conn_timeout,
-                          self.__use_ssl)
-        sock = mongo.get_socket()[0]
-        response = self.__simple_command(sock, 'admin', {'ismaster': 1})
+        mongo = self.pool_class(host, self.__max_pool_size,
+                                self.__net_timeout, self.__conn_timeout,
+                                self.__use_ssl)
+        sock_info = mongo.get_socket()
+        response = self.__simple_command(sock_info.sock, 'admin', {'ismaster': 1})
+        mongo.return_socket(sock_info)
         return response, mongo
 
     def __update_pools(self):
@@ -456,7 +457,7 @@ class ReplicaSetConnection(common.BaseObject):
         """
         secondaries = []
         for host in self.__hosts:
-            mongo = None
+            mongo, sock = None, None
             try:
                 if host in self.__pools:
                     mongo = self.__pools[host]
@@ -469,8 +470,9 @@ class ReplicaSetConnection(common.BaseObject):
                                           'last_checkout': time.time(),
                                           'max_bson_size': bson_max}
             except (ConnectionFailure, socket.error):
-                if mongo:
-                    mongo['pool'].discard_socket()
+                if mongo and sock:
+                    # TODO: fix this? when can it happen?
+                    mongo['pool'].discard_socket(sock)
                 continue
             # Only use hosts that are currently in 'secondary' state
             # as readers.
@@ -494,8 +496,8 @@ class ReplicaSetConnection(common.BaseObject):
             try:
                 if node in self.__pools:
                     mongo = self.__pools[node]
-                    sock = self.__socket(mongo)
-                    response = self.__simple_command(sock, 'admin',
+                    sock_info = self.__socket(mongo)
+                    response = self.__simple_command(sock_info.sock, 'admin',
                                                      {'ismaster': 1})
                 else:
                     response, conn = self.__is_master(node)
@@ -536,8 +538,8 @@ class ReplicaSetConnection(common.BaseObject):
     def __check_is_primary(self, host):
         """Checks if this host is the primary for the replica set.
         """
+        mongo, sock = None, None
         try:
-            mongo = None
             if host in self.__pools:
                 mongo = self.__pools[host]
                 sock = self.__socket(mongo)
@@ -549,9 +551,12 @@ class ReplicaSetConnection(common.BaseObject):
                                       'last_checkout': time.time(),
                                       'max_bson_size': bson_max}
         except (ConnectionFailure, socket.error), why:
-            if mongo:
-                mongo['pool'].discard_socket()
+            if sock and mongo:
+                mongo['pool'].discard_socket(sock)
             raise ConnectionFailure("%s:%d: %s" % (host[0], host[1], str(why)))
+        
+        if sock and mongo:
+            mongo['pool'].return_socket(sock)
 
         if res["ismaster"]:
             return host
@@ -595,21 +600,21 @@ class ReplicaSetConnection(common.BaseObject):
         the last socket checkout, to keep performance reasonable - we
         can't avoid those completely anyway.
         """
-        sock, authset = mongo['pool'].get_socket()
+        sock_info = mongo['pool'].get_socket()
 
         now = time.time()
         if now - mongo['last_checkout'] > 1:
-            if _closed(sock):
+            if _closed(sock_info.sock):
                 mongo['pool'] = pool.Pool(mongo['pool'].host,
                                           self.__max_pool_size,
                                           self.__net_timeout,
                                           self.__conn_timeout,
                                           self.__use_ssl)
-                sock, authset = mongo['pool'].get_socket()
+                sock_info = mongo['pool'].get_socket()
         mongo['last_checkout'] = now
-        if self.__auth_credentials or authset:
-            self.__check_auth(sock, authset)
-        return sock
+        if self.__auth_credentials:
+            self.__check_auth(sock_info)
+        return sock_info
 
     def disconnect(self):
         """Disconnect from the replica set primary.

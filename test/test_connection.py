@@ -460,8 +460,10 @@ class TestConnection(unittest.TestCase):
         conn = get_connection()
         conn.pymongo_test.drop_collection("test")
         conn.pymongo_test.test.insert({"foo": "bar"})
-        self.assertNotEqual(None, conn._Connection__pool.sock)
-        self.assertEqual(0, len(conn._Connection__pool.sockets))
+
+        # The socket used for the previous commands has been returned to the
+        # pool
+        self.assertEqual(1, len(conn._Connection__pool.sockets))
 
         # We need exec here because if the Python version is less than 2.6
         # these with-statements won't even compile.
@@ -470,7 +472,7 @@ with contextlib.closing(conn):
     self.assertEquals("bar", conn.pymongo_test.test.find_one()["foo"])
 """
 
-        self.assertEqual(None, conn._Connection__pool.sock)
+        # Calling conn.close() has reset the pool
         self.assertEqual(0, len(conn._Connection__pool.sockets))
 
         exec """
@@ -478,7 +480,7 @@ with get_connection() as connection:
     self.assertEquals("bar", connection.pymongo_test.test.find_one()["foo"])
 """
 
-        self.assertEqual(None, connection._Connection__pool.sock)
+        # Calling conn.close() has reset the pool
         self.assertEqual(0, len(connection._Connection__pool.sockets))
 
     def test_interrupt_signal(self):

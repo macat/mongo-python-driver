@@ -269,7 +269,7 @@ class Database(common.BaseObject):
 
     def command(self, command, value=1,
                 check=True, allowable_errors=[],
-                uuid_subtype=OLD_UUID_SUBTYPE, **kwargs):
+                uuid_subtype=OLD_UUID_SUBTYPE, sock=None, **kwargs):
         """Issue a MongoDB command.
 
         Send command `command` to the database and return the
@@ -314,9 +314,12 @@ class Database(common.BaseObject):
             in this list will be ignored by error-checking
           - `uuid_subtype` (optional): The BSON binary subtype to use
             for a UUID used in this command.
+          - `sock` (optional): The socket on which to execute this command
           - `**kwargs` (optional): additional keyword arguments will
             be added to the command document before it is sent
 
+        .. versionchanged:: 2.2
+           Added the `sock` argument
         .. versionchanged:: 1.6
            Added the `value` argument for string commands, and keyword
            arguments for additional command options.
@@ -345,7 +348,7 @@ class Database(common.BaseObject):
 
         command.update(kwargs)
 
-        result = self["$cmd"].find_one(command, **extra_opts)
+        result = self["$cmd"].find_one(command, sock=sock, **extra_opts)
 
         if check:
             msg = "command %s failed: %%s" % repr(command).replace("%", "%%")
@@ -569,7 +572,7 @@ class Database(common.BaseObject):
         """
         self.system.users.remove({"user": name}, safe=True)
 
-    def authenticate(self, name, password):
+    def authenticate(self, name, password, sock=None):
         """Authenticate to use this database.
 
         Once authenticated, the user has full read and write access to
@@ -609,6 +612,7 @@ class Database(common.BaseObject):
         :Parameters:
           - `name`: the name of the user to authenticate
           - `password`: the password of the user to authenticate
+          - `sock`: a connected socket to use
 
         .. mongodoc:: authenticate
         """
@@ -617,19 +621,23 @@ class Database(common.BaseObject):
         if not isinstance(password, basestring):
             raise TypeError("password must be an instance of basestring")
 
-        nonce = self.command("getnonce")["nonce"]
-        key = helpers._auth_key(nonce, name, password)
         try:
-            self.command("authenticate", user=unicode(name),
-                         nonce=nonce, key=key)
-            self.connection._cache_credentials(self.name,
-                                               unicode(name),
-                                               unicode(password))
-            return True
-        except OperationFailure:
-            return False
+            self.connection.start_request(sock)
+            nonce = self.command("getnonce")["nonce"]
+            key = helpers._auth_key(nonce, name, password)
+            try:
+                self.command("authenticate", user=unicode(name),
+                             nonce=nonce, key=key, sock=sock)
+                self.connection._cache_credentials(self.name,
+                                                   unicode(name),
+                                                   unicode(password))
+                return True
+            except OperationFailure:
+                return False
+        finally:
+            self.connection.end_request()
 
-    def logout(self):
+    def logout(self, sock=None):
         """Deauthorize use of this database for this connection
         and future connections.
 
@@ -638,7 +646,7 @@ class Database(common.BaseObject):
            authenticated for this database unless you reset all sockets
            with :meth:`~pymongo.connection.Connection.disconnect`.
         """
-        self.command("logout")
+        self.command("logout", sock=sock)
         self.connection._purge_credentials(self.name)
 
     def dereference(self, dbref):
