@@ -173,7 +173,7 @@ class TestConnection(TestConnectionReplicaSetBase):
         )
 
         db = c.pymongo_test
-        db.test.remove({})
+        db.test.remove({}, safe=True)
         self.assertEqual(0, db.test.count())
         db.test.insert({'foo': 'x'}, safe=True, w=self.w)
         self.assertEqual(1, db.test.count())
@@ -189,7 +189,7 @@ class TestConnection(TestConnectionReplicaSetBase):
         self.assertTrue(cursor._Cursor__connection_id in c.secondaries)
 
         self.assertEqual(1, db.test.count())
-        db.test.remove({})
+        db.test.remove({}, safe=True)
         self.assertEqual(0, db.test.count())
         c.drop_database(db)
         c.close()

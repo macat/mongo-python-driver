@@ -733,25 +733,25 @@ class Connection(common.BaseObject):
           - `with_last_error`: check getLastError status after sending the
             message
         """
+        rv = None
         sock = self.__socket()
         try:
-            try:
-                (request_id, data) = self.__check_bson_size(message)
-                sock.sendall(data)
-                # Safe mode. We pack the message together with a lastError
-                # message and send both. We then get the response (to the
-                # lastError) and raise OperationFailure if it is an error
-                # response.
-                if with_last_error:
-                    response = self.__receive_message_on_socket(1, request_id,
-                                                                sock)
-                    return self.__check_response_to_last_error(response)
-                return None
-            except (ConnectionFailure, socket.error), e:
-                self.disconnect()
-                raise AutoReconnect(str(e))
-        finally:
+            (request_id, data) = self.__check_bson_size(message)
+            sock.sendall(data)
+            # Safe mode. We pack the message together with a lastError
+            # message and send both. We then get the response (to the
+            # lastError) and raise OperationFailure if it is an error
+            # response.
+            if with_last_error:
+                response = self.__receive_message_on_socket(1, request_id,
+                                                            sock)
+                rv = self.__check_response_to_last_error(response)
+
             self.__pool.return_socket(sock)
+            return rv
+        except (ConnectionFailure, socket.error), e:
+            self.disconnect()
+            raise AutoReconnect(str(e))
 
     def __receive_data_on_socket(self, length, sock):
         """Lowest level receive operation.
@@ -797,7 +797,7 @@ class Connection(common.BaseObject):
     # we just ignore _must_use_master here: it's only relevant for
     # MasterSlaveConnection instances.
     def _send_message_with_response(self, message,
-                                    _must_use_master=False, sock=None,
+                                    _must_use_master=False,
                                     **kwargs):
         """Send a message to Mongo and return the response.
 
@@ -806,8 +806,7 @@ class Connection(common.BaseObject):
         :Parameters:
           - `message`: (request_id, data) pair making up the message to send
         """
-        if not sock:
-            sock = self.__socket()
+        sock = self.__socket()
 
         try:
             try:
@@ -820,10 +819,15 @@ class Connection(common.BaseObject):
         finally:
             if "network_timeout" in kwargs:
                 try:
+                    # Restore the socket's original timeout and return it to
+                    # the pool
                     sock.settimeout(self.__net_timeout)
+                    self.__pool.return_socket(sock)
                 except socket.error:
                     # There was an exception and we've closed the socket
                     pass
+            else:
+                self.__pool.return_socket(sock)
 
     def start_request(self, sock=None):
         """Ensure the current thread or greenlet always uses the same socket
@@ -836,6 +840,7 @@ class Connection(common.BaseObject):
            In Python 2.6 and above, or in Python 2.5 with
            "from __future__ import with_statement", start_request() can be used
            as a context manager:
+        # TODO: do we run doctests? if so, make sure this works.
         >>> connection = pymongo.Connection()
         >>> db = connection.test
         >>> _id = db.test_collection.insert({}, safe=True)
@@ -846,18 +851,21 @@ class Connection(common.BaseObject):
         ...     print db.test_collection.find({'_id': _id})
 
         .. versionadded:: 2.2
-           The `sock` parameter.
+           The `sock` parameter, and the `RequestContextManager`
+           (`start_request` previously returned None).
         """
-        # TODO: test
         class RequestContextManager(object):
             def __init__(self, connection):
                 self.connection = connection
 
             def __enter__(self):
-                pass
+                return self
 
-            def __exit__(self):
+            def __exit__(self, exc_type, exc_val, exc_tb):
                 self.connection.end_request()
+                # Returning False means, "Don't suppress exceptions if any were
+                # thrown within the
+                return False
 
         self.__pool.start_request(sock)
 

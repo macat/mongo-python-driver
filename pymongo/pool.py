@@ -15,7 +15,6 @@
 import os
 import socket
 import threading
-import sys
 
 from pymongo.errors import ConnectionFailure
 
@@ -41,15 +40,15 @@ class Pool(object):
         self.use_ssl = use_ssl
 
     def _reset(self):
-        print >> sys.stderr, 'reset'
         self.pid = os.getpid()
         self.sockets = set()
 
         # Map socket -> set of (host, port, database) triples for which this
         # socket has been authorized
         # TODO: make sure this works and unittest that we don't unnecessarily
-        # re-authorize sockets that are already authorized
-        self.authorizations = {}
+        # re-authorize sockets that are already authorized, for single,
+        # master-slave, and replica-set connections
+        self.authsets = {}
 
         # Map thread -> socket, or (thread, greenlet) -> socket
         self.requests = {}
@@ -90,13 +89,12 @@ class Pool(object):
                                         "not be configured with SSL support.")
 
         s.settimeout(self.net_timeout)
-
-        print >> sys.stderr, 'created', s
         return s
 
-    def get_socket(self, pair):
+    def get_socket(self, pair=None):
         """Get a socket from the pool. Returns a new socket if the
         pool is empty.
+        # TODO: document param
         # TODO: document return value
         # TODO: search for all calls to get_socket() and make sure they're
           matched by return_socket()
@@ -129,7 +127,6 @@ class Pool(object):
             # for this request until end_request.
             self.requests[request_key] = sock
 
-        print >> sys.stderr, sock, 'from_pool', from_pool, self._request_key()
         return sock, from_pool
 
     def start_request(self, sock=None):
@@ -144,23 +141,24 @@ class Pool(object):
     def end_request(self):
         request_key = self._request_key()
         request_sock = self.requests.get(request_key)
-        if request_sock:
-            self.return_socket(request_sock)
 
         # Even if request_sock is None, it could mean someone called
-        # start_request with sock=None
+        # start_request with sock=None. We definitely do not want this
+        # request_key in self.requests.
         if request_key in self.requests:
             del self.requests[request_key]
+
+        self.return_socket(request_sock)
 
     def discard_socket(self, sock):
         """Close and discard the active socket.
         """
-        print >> sys.stderr, 'discard', sock
-        sock.close()
-        request_key = self._request_key()
-        request_sock = self.requests.get(request_key)
-        if request_sock == sock:
-            del self.requests[request_key]
+        if sock:
+            sock.close()
+            request_key = self._request_key()
+            request_sock = self.requests.get(request_key)
+            if request_sock == sock:
+                del self.requests[request_key]
 
     def return_socket(self, sock):
         """Return the socket currently in use to the pool. If the
@@ -169,15 +167,21 @@ class Pool(object):
         if self.pid != os.getpid():
             self._reset()
         elif sock:
-            # There's a race condition here, but we deliberately
-            # ignore it.  It means that if the pool_size is 10 we
-            # might actually keep slightly more than that.
-            if len(self.sockets) < self.max_size:
-                print >> sys.stderr, 'returned', sock
-                if sock in self.sockets:
-                    pass
-                assert sock not in self.sockets
-                self.sockets.add(sock)
-            else:
-                print >> sys.stderr, 'closing', sock
-                sock.close()
+            # Don't really return a socket if we're in a request
+            request_key = self._request_key()
+            if sock is not self.requests.get(request_key):
+                # There's a race condition here, but we deliberately
+                # ignore it.  It means that if the pool_size is 10 we
+                # might actually keep slightly more than that.
+                if len(self.sockets) < self.max_size:
+                    if sock in self.sockets:
+                        # Unexpected, but let it pass
+                        pass
+                    self.sockets.add(sock)
+                else:
+                    sock.close()
+
+    def get_authset(self, sock):
+        """Set of database names for which this socket has been authenticated
+        """
+        return self.authsets.setdefault(sock, set())
