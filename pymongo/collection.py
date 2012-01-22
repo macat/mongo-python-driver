@@ -508,9 +508,6 @@ class Collection(common.BaseObject):
           - `**kwargs` (optional): any additional keyword arguments
             are the same as the arguments to :meth:`find`.
 
-        .. versionchanged:: 2.2
-           Added the `sock` argument
-
         .. versionchanged:: 1.7
            Allow passing any of the arguments that are valid for
            :meth:`find`.
@@ -604,9 +601,6 @@ class Collection(common.BaseObject):
 
         .. note:: The `max_scan` parameter requires server
            version **>= 1.5.1**
-
-        .. versionchanged:: 2.2
-           Added the `sock` argument
 
         .. versionadded:: 1.11+
            The `await_data`, `partial`, and `manipulate` parameters.

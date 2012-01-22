@@ -269,7 +269,7 @@ class Database(common.BaseObject):
 
     def command(self, command, value=1,
                 check=True, allowable_errors=[],
-                uuid_subtype=OLD_UUID_SUBTYPE, sock=None, **kwargs):
+                uuid_subtype=OLD_UUID_SUBTYPE, **kwargs):
         """Issue a MongoDB command.
 
         Send command `command` to the database and return the
@@ -314,12 +314,9 @@ class Database(common.BaseObject):
             in this list will be ignored by error-checking
           - `uuid_subtype` (optional): The BSON binary subtype to use
             for a UUID used in this command.
-          - `sock` (optional): The socket on which to execute this command
           - `**kwargs` (optional): additional keyword arguments will
             be added to the command document before it is sent
 
-        .. versionchanged:: 2.2
-           Added the `sock` argument
         .. versionchanged:: 1.6
            Added the `value` argument for string commands, and keyword
            arguments for additional command options.
@@ -344,11 +341,11 @@ class Database(common.BaseObject):
 
         fields = kwargs.get('fields')
         if fields is not None and not isinstance(fields, dict):
-                kwargs['fields'] = helpers._fields_list_to_dict(fields)
+            kwargs['fields'] = helpers._fields_list_to_dict(fields)
 
         command.update(kwargs)
 
-        result = self["$cmd"].find_one(command, sock=sock, **extra_opts)
+        result = self["$cmd"].find_one(command, **extra_opts)
 
         if check:
             msg = "command %s failed: %%s" % repr(command).replace("%", "%%")
@@ -572,8 +569,10 @@ class Database(common.BaseObject):
         """
         self.system.users.remove({"user": name}, safe=True)
 
-    def authenticate(self, name, password, sock=None):
+    def authenticate(self, name, password):
         """Authenticate to use this database.
+
+        # TODO: update docstring
 
         Once authenticated, the user has full read and write access to
         this database. Raises :class:`TypeError` if either `name` or
@@ -612,7 +611,6 @@ class Database(common.BaseObject):
         :Parameters:
           - `name`: the name of the user to authenticate
           - `password`: the password of the user to authenticate
-          - `sock`: a connected socket to use
 
         .. mongodoc:: authenticate
         """
@@ -622,12 +620,12 @@ class Database(common.BaseObject):
             raise TypeError("password must be an instance of basestring")
 
         try:
-            self.connection.start_request(sock)
+            self.connection.start_request()
             nonce = self.command("getnonce")["nonce"]
             key = helpers._auth_key(nonce, name, password)
             try:
                 self.command("authenticate", user=unicode(name),
-                             nonce=nonce, key=key, sock=sock)
+                             nonce=nonce, key=key)
                 self.connection._cache_credentials(self.name,
                                                    unicode(name),
                                                    unicode(password))
@@ -700,8 +698,9 @@ class Database(common.BaseObject):
         """This is only here so that some API misusages are easier to debug.
         """
         raise TypeError("'Database' object is not callable. If you meant to "
-                        "call the '%s' method on a 'Connection' object it is "
-                        "failing because no such method exists." % self.__name)
+                        "call the '%s' method on a '%s' object it is "
+                        "failing because no such method exists." % (
+                            self.__name, self.__connection.__class__.__name__))
 
 
 class SystemJS(object):

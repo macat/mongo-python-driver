@@ -40,6 +40,7 @@ import sys
 import time
 import warnings
 
+from bson.son import SON
 from pymongo import (common,
                      database,
                      helpers,
@@ -408,18 +409,51 @@ class Connection(common.BaseObject):
         elif db_name in self.__auth_credentials:
             del self.__auth_credentials[db_name]
 
-    def __authenticate_socket(self, sock):
+    def __check_auth(self, sock, pool):
         """Authenticate using cached database credentials.
 
         If credentials for the 'admin' database are available only
         this database is authenticated, since this gives global access.
         """
+        names = set(self.__auth_credentials.iterkeys())
+        authset = pool.get_authset(sock)
+
+        # Logout from any databases no longer listed in the credentials cache.
+        for dbname in authset - names:
+            try:
+                self.__simple_command(sock, dbname, {'logout': 1})
+            # TODO: We used this socket to logout. Fix logout so we don't
+            # have to catch this.
+            except OperationFailure:
+                pass
+            authset.discard(dbname)
+
+        # Once logged into the admin database we can access anything.
+        if "admin" in authset:
+            return
+
         if "admin" in self.__auth_credentials:
             username, password = self.__auth_credentials["admin"]
-            self.admin.authenticate(username, password, sock)
+            self.__auth(sock, 'admin', username, password)
+            authset.add('admin')
         else:
-            for db_name, (u, p) in self.__auth_credentials.iteritems():
-                self[db_name].authenticate(u, p, sock)
+            for db_name in names - authset:
+                user, pwd = self.__auth_credentials[db_name]
+                self.__auth(sock, db_name, user, pwd)
+                authset.add(db_name)
+
+#    def __authenticate_socket(self):
+#        """Authenticate using cached database credentials.
+#
+#        If credentials for the 'admin' database are available only
+#        this database is authenticated, since this gives global access.
+#        """
+#        if "admin" in self.__auth_credentials:
+#            username, password = self.__auth_credentials["admin"]
+#            self.admin.authenticate(username, password)
+#        else:
+#            for db_name, (u, p) in self.__auth_credentials.iteritems():
+#                self[db_name].authenticate(u, p)
 
     @property
     def host(self):
@@ -490,6 +524,30 @@ class Connection(common.BaseObject):
         .. versionadded:: 1.10
         """
         return self.__max_bson_size
+
+    def __simple_command(self, sock, dbname, spec):
+        """Send a command to the server.
+        """
+        rqst_id, msg, _ = message.query(0, dbname + '.$cmd', 0, -1, spec)
+        sock.sendall(msg)
+        response = self.__receive_message_on_socket(1, rqst_id, sock)
+        response = helpers._unpack_response(response)['data'][0]
+        msg = "command %r failed: %%s" % spec
+        helpers._check_command_response(response, None, msg)
+        return response
+
+    def __auth(self, sock, dbname, user, passwd):
+        """Authenticate socket `sock` against database `dbname`.
+        """
+        # Get a nonce
+        response = self.__simple_command(sock, dbname, {'getnonce': 1})
+        nonce = response['nonce']
+        key = helpers._auth_key(nonce, user, passwd)
+
+        # Actually authenticate
+        query = SON([('authenticate', 1),
+            ('user', user), ('nonce', nonce), ('key', key)])
+        self.__simple_command(sock, dbname, query)
 
     def __try_node(self, node):
         """Try to connect to this node and see if it works
@@ -606,8 +664,8 @@ class Connection(common.BaseObject):
                 self.disconnect()
                 sock, from_pool = self.__pool.get_socket((host, port))
         self.__last_checkout = t
-        if self.__auth_credentials and not from_pool:
-            self.__authenticate_socket(sock)
+        if self.__auth_credentials:
+            self.__check_auth(sock, self.__pool)
         return sock
 
     def disconnect(self):
@@ -733,7 +791,6 @@ class Connection(common.BaseObject):
           - `with_last_error`: check getLastError status after sending the
             message
         """
-        rv = None
         sock = self.__socket()
         try:
             (request_id, data) = self.__check_bson_size(message)
@@ -742,6 +799,7 @@ class Connection(common.BaseObject):
             # message and send both. We then get the response (to the
             # lastError) and raise OperationFailure if it is an error
             # response.
+            rv = None
             if with_last_error:
                 response = self.__receive_message_on_socket(1, request_id,
                                                             sock)
@@ -829,13 +887,9 @@ class Connection(common.BaseObject):
             else:
                 self.__pool.return_socket(sock)
 
-    def start_request(self, sock=None):
+    def start_request(self):
         """Ensure the current thread or greenlet always uses the same socket
            until it calls end_request().
-
-        :Parameters:
-          - `sock` (optional): a connected socket to associate with this thread
-            or greenlet.
 
            In Python 2.6 and above, or in Python 2.5 with
            "from __future__ import with_statement", start_request() can be used
@@ -850,26 +904,31 @@ class Connection(common.BaseObject):
         ...     # Definitely read the document after the final update completes
         ...     print db.test_collection.find({'_id': _id})
 
-        .. versionadded:: 2.2
-           The `sock` parameter, and the `RequestContextManager`
-           (`start_request` previously returned None).
+        .. versionadded:: 2.1.1+
+           The `Request` return value. `start_request` previously returned None
         """
-        class RequestContextManager(object):
+        class Request(object):
+            """
+            A context manager returned by Pool.start_request(), so you can do
+            `with pool.start_request(): do_something()` in Python 2.5+.
+            """
             def __init__(self, connection):
                 self.connection = connection
+
+            def end(self):
+                self.connection.end_request()
 
             def __enter__(self):
                 return self
 
             def __exit__(self, exc_type, exc_val, exc_tb):
-                self.connection.end_request()
+                self.end()
                 # Returning False means, "Don't suppress exceptions if any were
-                # thrown within the
+                # thrown within the block
                 return False
 
-        self.__pool.start_request(sock)
-
-        return RequestContextManager(self)
+        self.__pool.start_request()
+        return Request(self)
 
     def end_request(self):
         """Allow this thread's connection to return to the pool.

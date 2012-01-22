@@ -601,7 +601,7 @@ class ReplicaSetConnection(common.BaseObject):
         # Couldn't find the primary.
         raise AutoReconnect(', '.join(errors))
 
-    def __socket(self, mongo):
+    def __socket(self, mongo, start_request=False):
         """Get a socket from the pool.
 
         If it's been > 1 second since the last time we checked out a
@@ -613,10 +613,14 @@ class ReplicaSetConnection(common.BaseObject):
         can't avoid those completely anyway.
         """
         pool = mongo['pool']
+        if start_request:
+            pool.start_request()
+
         sock, from_pool = pool.get_socket()
 
         now = time.time()
         if now - mongo['last_checkout'] > 1:
+            # TODO: shall we do this even if not from_pool?
             if _closed(sock):
                 # TODO: is it really necessary to discard whole pool in this
                 # case?
@@ -625,6 +629,8 @@ class ReplicaSetConnection(common.BaseObject):
                                                 self.__net_timeout,
                                                 self.__conn_timeout,
                                                 self.__use_ssl)
+                if start_request:
+                    pool.start_request()
                 sock, from_pool = pool.get_socket()
         mongo['last_checkout'] = now
         if self.__auth_credentials:
@@ -769,6 +775,7 @@ class ReplicaSetConnection(common.BaseObject):
         sock = None
         try:
             sock = self.__socket(mongo)
+
             if "network_timeout" in kwargs:
                 sock.settimeout(kwargs['network_timeout'])
 
@@ -838,6 +845,72 @@ class ReplicaSetConnection(common.BaseObject):
                 self.disconnect()
                 errors.append(why)
         raise AutoReconnect(', '.join(errors))
+
+    def start_request(self):
+        """Ensure the current thread or greenlet always uses the same socket
+           until it calls end_request().
+
+           In Python 2.6 and above, or in Python 2.5 with
+           "from __future__ import with_statement", start_request() can be used
+           as a context manager:
+        # TODO: do we run doctests? if so, make sure this works.
+        >>> connection = pymongo.Connection()
+        >>> db = connection.test
+        >>> _id = db.test_collection.insert({}, safe=True)
+        >>> with connection.start_request():
+        ...     for i in range(100):
+        ...         db.test_collection.update({'_id': _id}, {'$set': {'i':i}})
+        ...     # Definitely read the document after the final update completes
+        ...     print db.test_collection.find({'_id': _id})
+
+        .. versionadded:: 2.1.1+
+           The `ReplicaSetRequest` return value. `start_request` previously
+           returned None
+        """
+        class ReplicaSetRequest(object):
+            def __init__(self, connection):
+                self.connection = connection
+
+            def end(self):
+                self.connection.end_request()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.end()
+                # Returning False means, "Don't suppress exceptions if any were
+                # thrown within the block
+                return False
+
+        for mongo in self.__pools.values():
+            mongo['pool'].start_request()
+
+        return ReplicaSetRequest(self)
+
+    def end_request(self):
+        """Allow this thread's connection to return to the pool.
+
+        # TODO: update documentation
+
+        Calling :meth:`end_request` allows the :class:`~socket.socket`
+        that has been reserved for this thread to be returned to the
+        pool. Other threads will then be able to re-use that
+        :class:`~socket.socket`. If your application uses many
+        threads, or has long-running threads that infrequently perform
+        MongoDB operations, then judicious use of this method can lead
+        to performance gains. Care should be taken, however, to make
+        sure that :meth:`end_request` is not called in the middle of a
+        sequence of operations in which ordering is important. This
+        could lead to unexpected results.
+
+        One important case is when a thread is dying permanently. It
+        is best to call :meth:`end_request` when you know a thread is
+        finished, as otherwise its :class:`~socket.socket` will not be
+        reclaimed.
+        """
+        for mongo in self.__pools.values():
+            mongo['pool'].end_request()
 
     def __cmp__(self, other):
         # XXX: Implement this?
@@ -955,11 +1028,15 @@ class ReplicaSetConnection(common.BaseObject):
         if from_host is not None:
             command["fromhost"] = from_host
 
-        if username is not None:
-            nonce = self.admin.command("copydbgetnonce",
-                                       fromhost=from_host)["nonce"]
-            command["username"] = username
-            command["nonce"] = nonce
-            command["key"] = helpers._auth_key(nonce, username, password)
+        try:
+            self.start_request()
+            if username is not None:
+                nonce = self.admin.command("copydbgetnonce",
+                                           fromhost=from_host)["nonce"]
+                command["username"] = username
+                command["nonce"] = nonce
+                command["key"] = helpers._auth_key(nonce, username, password)
 
-        return self.admin.command("copydb", **command)
+            return self.admin.command("copydb", **command)
+        finally:
+            self.end_request()

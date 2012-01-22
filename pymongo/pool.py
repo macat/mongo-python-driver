@@ -108,7 +108,7 @@ class Pool(object):
         if self.pid != os.getpid():
             self._reset()
 
-        # Have we called start_request() before?
+        # Have we opened a socket for this request?
         request_key = self._request_key()
         sock = self.requests.get(request_key)
         if sock:
@@ -122,29 +122,23 @@ class Pool(object):
             sock, from_pool = self.connect(pair), False
 
         if request_key in self.requests:
-            # self.requests[request_key] is None, so someone called
-            # start_request but didn't provide a socket. Let's use this socket
-            # for this request until end_request.
+            # self.requests[request_key] is None, so start_request has been
+            # called earlier. Let's use this socket for this request until
+            # end_request.
             self.requests[request_key] = sock
 
         return sock, from_pool
 
-    def start_request(self, sock=None):
-        # TODO: explain
-        # TODO: test with and without a sock provided
-        # Have we called start_request() before?
-        request_key = self._request_key()
-        request_sock = self.requests.get(request_key)
-        if sock or not request_sock:
-            self.requests[request_key] = sock
+    def start_request(self):
+        # If we're already in a request, do nothing, otherwise put None in the
+        # dict to indicate we're in a request. None will be replaced by a socket
+        # as soon as one is needed.
+        self.requests.setdefault(self._request_key(), None)
 
     def end_request(self):
         request_key = self._request_key()
         request_sock = self.requests.get(request_key)
 
-        # Even if request_sock is None, it could mean someone called
-        # start_request with sock=None. We definitely do not want this
-        # request_key in self.requests.
         if request_key in self.requests:
             del self.requests[request_key]
 
@@ -157,6 +151,8 @@ class Pool(object):
             sock.close()
             request_key = self._request_key()
             request_sock = self.requests.get(request_key)
+
+            # We're ending the request
             if request_sock == sock:
                 del self.requests[request_key]
 
