@@ -8,7 +8,7 @@ from gevent import Greenlet
 # From https://gist.github.com/1369699/5b674d81a84f945373e6bc8a4425eccb58fd3ebf
 import geventmongo
 
-class GreenletTest():#unittest.TestCase):
+class GreenletTest(object):#unittest.TestCase):
     def _test_greenlet(self):
         """
         Demonstrate a problem with pymongo 2.1's connection pool: it relies on

@@ -55,7 +55,7 @@ class Pool(object):
 
     def _request_key(self):
         """Overridable"""
-        return id(threading.current_thread())
+        return id(threading.currentThread())
 
     def connect(self, pair):
         """Connect to Mongo and return a new (connected) socket.
