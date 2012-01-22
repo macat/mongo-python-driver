@@ -345,7 +345,7 @@ class TestPooling(unittest.TestCase):
         c = get_connection(max_pool_size=4)
 
         threads = []
-        for i in range(100):
+        for i in range(50):
             t = CreateAndReleaseSocket(c)
             t.start()
             threads.append(t)
