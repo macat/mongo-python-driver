@@ -81,11 +81,14 @@ class Pool(object):
         from_pool = True
         sock = self._used.get(greenlet)
         if sock is None:
-            with self._lock:
+            try:
+                self._lock.acquire()
                 if self._count < self.pool_size:
                     self._count += 1
                     from_pool = False
                     sock = self.connect(host, port)
+            finally:
+                self._lock.release()
         if sock is None:
             from_pool = True
             sock = self._queue.get(timeout=self.network_timeout)
@@ -109,8 +112,11 @@ class Pool(object):
                 del self._used[greenlet]
                 self._queue.put(sock)
         except:
-            with self._lock:
+            try:
+                self._lock.acquire()
                 self._count -= 1
+            finally:
+                self._lock.release()
 
 
 def patch():
