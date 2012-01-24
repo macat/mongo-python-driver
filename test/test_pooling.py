@@ -162,22 +162,27 @@ class OneOp(threading.Thread):
 
 class CreateAndReleaseSocket(threading.Thread):
 
-    def __init__(self, connection):
+    def __init__(self, connection, start_request, end_request):
         threading.Thread.__init__(self)
         self.c = connection
+        self.start_request = start_request
+        self.end_request = end_request
         self.passed = False
 
     def run(self):
-        # Do an operation that requires a socket for .5 seconds.
+        # Do an operation that requires a socket for .25 seconds.
         # test_max_pool_size uses this to spin up lots of threads requiring
         # lots of simultaneous connections, to ensure that Pool obeys its
         # max_size configuration and closes extra sockets as they're returned.
         # We need a delay here to ensure that more than max_size sockets are
         # needed at once.
-        where = delay(.5)
+        where = delay(.25)
+        if self.start_request:
+            self.c.start_request()
         self.c.test.test.find_one({'$where': where})
+        if self.end_request:
+            self.c.end_request()
         self.passed = True
-
 
 class TestPooling(unittest.TestCase):
 
@@ -193,9 +198,16 @@ class TestPooling(unittest.TestCase):
         self.c = None
 
     def test_max_pool_size_validation(self):
-        self.assertRaises(ValueError, Connection, max_pool_size=-1)
-        self.assertRaises(ConfigurationError, Connection, max_pool_size='foo')
-        c = Connection(max_pool_size=100)
+        self.assertRaises(
+            ValueError, Connection, host=host, port=port, max_pool_size=-1
+        )
+
+        self.assertRaises(
+            ConfigurationError, Connection, host=host, port=port,
+            max_pool_size='foo'
+        )
+
+        c = Connection(host=host, port=port, max_pool_size=100)
         self.assertEqual(c.max_pool_size, 100)
 
     def test_no_disconnect(self):
@@ -341,12 +353,12 @@ class TestPooling(unittest.TestCase):
         self.assertEqual(a_sock,
                          one(a._Connection__pool.get_socket((a.host, a.port))))
 
-    def test_max_pool_size(self):
+    def _test_max_pool_size(self, start_request, end_request):
         c = get_connection(max_pool_size=4)
 
         threads = []
-        for i in range(50):
-            t = CreateAndReleaseSocket(c)
+        for i in range(40):
+            t = CreateAndReleaseSocket(c, start_request, end_request)
             t.start()
             threads.append(t)
 
@@ -357,9 +369,35 @@ class TestPooling(unittest.TestCase):
             self.assert_(t.passed)
 
         # There's a race condition, so be lenient
-        self.assert_(abs(4 - len(c._Connection__pool.sockets)) < 4)
+        nsock = len(c._Connection__pool.sockets)
+        self.assert_(
+            abs(4 - nsock) < 4,
+            "Expected about 4 sockets in the pool, got %d" % nsock
+        )
 
+    def test_max_pool_size(self):
+        self._test_max_pool_size(False, False)
 
+    def test_max_pool_size_with_request(self):
+        self._test_max_pool_size(True, True)
+
+    def test_max_pool_size_with_leaked_request(self):
+        # Call start_request() but not end_request() -- this will leak requests,
+        # leaving open sockets that aren't included in the pool at all.
+        # pool.sockets will be empty because sockets are never returned to it.
+        # The sockets will be closed when all references to them are deleted,
+        # which will happen after the test completes and deletes its reference
+        # to a Connection instance.
+        self.assertRaises(
+            AssertionError,
+            self._test_max_pool_size,
+            start_request=True,
+            end_request=False
+        )
+
+    def test_max_pool_size_with_end_request_only(self):
+        # Call end_request() but not start_request()
+        self._test_max_pool_size(False, True)
 
 if __name__ == "__main__":
     unittest.main()
