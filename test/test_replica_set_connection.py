@@ -39,6 +39,8 @@ from pymongo.errors import (AutoReconnect,
                             InvalidName,
                             OperationFailure)
 from test import version
+from testutils import delay
+
 
 host = os.environ.get("DB_IP", socket.gethostname())
 port = int(os.environ.get("DB_PORT", 27017))
@@ -425,14 +427,7 @@ class TestConnection(TestConnectionReplicaSetBase):
         no_timeout.pymongo_test.test.insert({"x": 1}, safe=True)
 
         # A $where clause that takes a second longer than the timeout
-        where_func = """function (doc) {
-  var d = new Date().getTime() + (%f + 1) * 1000;;
-  var x = new Date().getTime();
-  while (x < d) {
-    x = new Date().getTime();
-  }
-  return true;
-}""" % timeout_sec
+        where_func = delay(1 + timeout_sec)
 
         def get_x(db):
             return db.test.find().where(where_func).next()["x"]

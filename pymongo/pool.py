@@ -58,7 +58,9 @@ class Pool(object):
         return id(threading.currentThread())
 
     def connect(self, pair):
-        """Connect to Mongo and return a new (connected) socket.
+        """Connect to Mongo and return a new (connected) socket. Note that the
+           pool does not keep a reference to the socket -- you must call
+           return_socket() when you're done with it.
         """
         # TODO: remove, or explain, this pair override business
         assert self.pair is None or pair is None
