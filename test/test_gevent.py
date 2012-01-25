@@ -28,7 +28,7 @@ def looplet(greenlets):
 
 
 class GeventTest(unittest.TestCase):
-    def test_gevent(self):
+    def _test_pool(self, use_greenlets, use_request):
         """
         Demonstrate a problem with pymongo 2.1's connection pool: it relies on
         threading.local to associate sockets with threads, so it doesn't support
@@ -45,6 +45,9 @@ class GeventTest(unittest.TestCase):
             (here's the error: gr1 tries to wait on the same socket as gr0)
         gr1: get results
         gr0: get results
+        
+        This method is written to use either greenlets or threads -- If we have
+        fixed Pool properly, the method will behave the same in either case.
         """
 
         NOT_STARTED = 0
@@ -54,35 +57,39 @@ class GeventTest(unittest.TestCase):
         try:
             from multiprocessing import Value, Process
         except ImportError:
+            # Python < 2.5
             raise SkipTest('No multiprocessing module')
         
         outcome = Value('i', NOT_STARTED)
 
+        results = {
+            'find_fast_result': None,
+            'find_slow_result': None,
+        }
+
         # Do test in separate process so patch_socket() doesn't affect all
-        # subsequent unittests in a big test run
+        # subsequent unittests
         def do_test():
-            try:
-                from gevent import Greenlet
-                from gevent import monkey
-            except ImportError:
-                outcome.value = SKIP
-                return
-
-            monkey.patch_socket()
-
-            cx = get_connection()
+            if use_greenlets:
+                try:
+                    from gevent import Greenlet
+                    from gevent import monkey
+                    monkey.patch_socket()
+                except ImportError:
+                    outcome.value = SKIP
+                    return
+    
+            cx = get_connection(use_greenlets=use_greenlets)
             db = cx.pymongo_test
             db.test.remove(safe=True)
             db.test.insert({'_id': 1})
 
-            results = {
-                'find_fast_result': None,
-                'find_slow_result': None,
-            }
-
             history = []
 
             def find_fast():
+                if use_request:
+                    cx.start_request()
+
                 history.append('find_fast start')
 
                 # With the old connection._Pool, this would throw
@@ -91,7 +98,13 @@ class GeventTest(unittest.TestCase):
                 results['find_fast_result'] = list(db.test.find())
                 history.append('find_fast done')
 
+                if use_request:
+                    cx.end_request()
+
             def find_slow():
+                if use_request:
+                    cx.start_request()
+
                 history.append('find_slow start')
 
                 # Javascript function that pauses for half a second
@@ -102,9 +115,19 @@ class GeventTest(unittest.TestCase):
 
                 history.append('find_slow done')
 
-            gr0, gr1 = Greenlet(find_slow), Greenlet(find_fast)
-            gr0.start()
-            gr1.start_later(.1)
+                if use_request:
+                    cx.end_request()
+
+            if use_greenlets:
+                gr0, gr1 = Greenlet(find_slow), Greenlet(find_fast)
+                gr0.start()
+                gr1.start_later(.1)
+            else:
+                gr0, gr1 = threading.Thread(target=find_slow), threading.Thread(target=find_fast)
+                gr0.start()
+                time.sleep(.1)
+                gr1.start()
+
             gr0.join()
             gr1.join()
 
@@ -135,65 +158,24 @@ class GeventTest(unittest.TestCase):
             'test failed'
         )
 
-    def test_threads(self):
-        """
-        Test the same sequence of calls as the gevent tests to ensure my test
-        is ok.
+    def test_threads_pool(self):
+        # Test the same sequence of calls as the gevent tests to ensure my test
+        # is ok.
+        self._test_pool(use_greenlets=False, use_request=False)
 
-        Run this before the gevent tests, since gevent.monkey.patch_socket()
-        can't be undone.
-        """
-        cx = get_connection()
-        db = cx.pymongo_test
-        db.test.remove()
-        db.test.insert({'_id': 1})
+    def test_threads_pool_request(self):
+        # Test the same sequence of calls as the gevent tests to ensure my test
+        # is ok.
+        self._test_pool(use_greenlets=False, use_request=True)
 
-        results = {
-            'find_fast_result': None,
-            'find_slow_result': None,
-        }
+    def test_greenlets_pool(self):
+        self._test_pool(use_greenlets=True, use_request=False)
 
-        history = []
+    def test_greenlets_pool_request(self):
+        self._test_pool(use_greenlets=True, use_request=True)
 
-        def find_fast():
-            history.append('find_fast start')
-            # AssertionError: This event is already used by another greenlet
-            results['find_fast_result'] = list(db.test.find())
-            history.append('find_fast done')
-
-        def find_slow():
-            history.append('find_slow start')
-
-            # Javascript function that pauses for half a second
-            where = """function() {
-                        var d = new Date((new Date()).getTime() + 500);
-                        while (d > (new Date())) { }; return true;
-                    }
-                    """
-
-            results['find_slow_result'] = list(db.test.find({'$where': where}))
-            history.append('find_slow done')
-
-        t0, t1 = threading.Thread(target=find_slow), threading.Thread(target=find_fast)
-        t0.start()
-        time.sleep(.1)
-        t1.start()
-        t0.join()
-        t1.join()
-
-        self.assertEqual([{'_id': 1}], results['find_slow_result'])
-
-        # Fails, since find_fast doesn't complete
-        self.assertEqual([{'_id': 1}], results['find_fast_result'])
-
-        self.assertEqual([
-            'find_slow start',
-            'find_fast start',
-            'find_fast done',
-            'find_slow done',
-        ], history)
-
-    def test_greenlet(self):
+    def test_greenlet_sockets(self):
+        # Check that Pool gives two sockets to two greenlets
         try:
             import greenlet
         except ImportError:
@@ -207,20 +189,28 @@ class GeventTest(unittest.TestCase):
             use_ssl=False
         )
 
-        sock_ids = []
+        socks = []
 
         def get_socket():
-            sock_ids.append(id(cx_pool.get_socket()))
+            cx_pool.start_request()
+
+            socks.append(cx_pool.get_socket())
 
         looplet([
             greenlet.greenlet(get_socket),
             greenlet.greenlet(get_socket),
         ])
 
-        self.assertEqual(2, len(sock_ids))
-        self.assertEqual(sock_ids[0], sock_ids[1])
+        self.assertEqual(2, len(socks))
+        self.assertNotEqual(socks[0], socks[1])
 
-    def test_greenlet_request(self):
+    def test_greenlet_sockets_with_request(self):
+        # Verify two assumptions: that start_request() with two greenlets and
+        # the regular pool will fail, meaning that the two greenlets will
+        # share one socket. Also check that start_request() with greenlet_pool
+        # succeeds, meaning that two greenlets will get different sockets (this
+        # is exactly the reason for creating greenlet_pool).
+
         try:
             import greenlet
         except ImportError:
@@ -238,33 +228,77 @@ class GeventTest(unittest.TestCase):
         )
 
         for pool_class, expect_success in [
-            (pool.Pool, False),
             (greenlet_pool.GreenletPool, True),
+            (pool.Pool, False),
         ]:
             cx_pool = pool_class(**pool_args)
-            sock_ids = []
+
+            # Map: greenlet -> socket
+            greenlet2socks = {}
             main = greenlet.getcurrent()
 
             def get_socket_in_request():
+                # Get a socket from the pool twice, switching contexts each time
                 cx_pool.start_request()
                 main.switch()
-                sock_ids.append(id(cx_pool.get_socket()))
+
+                for i in range(2):
+                    sock, from_pool = cx_pool.get_socket()
+                    greenlet2socks.setdefault(
+                        greenlet.getcurrent(), []
+                    ).append(sock)
+
+                    main.switch()
+
                 cx_pool.end_request()
 
-            looplet([
+            greenlets = [
                 greenlet.greenlet(get_socket_in_request),
                 greenlet.greenlet(get_socket_in_request),
-            ])
+            ]
 
-            self.assertEqual(2, len(sock_ids))
+            # Run both greenlets to completion
+            looplet(greenlets)
+
+            socks_for_gr0 = greenlet2socks[greenlets[0]]
+            socks_for_gr1 = greenlet2socks[greenlets[1]]
+
+            # Whether we expect requests to work or not, we definitely expect
+            # greenlet2socks to have the same number of keys and values
+            self.assertEqual(2, len(greenlet2socks))
+            self.assertEqual(2, len(socks_for_gr0))
+            self.assertEqual(2, len(socks_for_gr1))
+
+            # Again, regardless of whether requests work, a greenlet will get
+            # the same socket each time it calls get_socket() within a request.
+            # What we're really testing is that the two *different* greenlets
+            # get *different* sockets from each other.
+            self.assertEqual(
+                socks_for_gr0[0], socks_for_gr0[1],
+                "Expected greenlet 0 to get the same socket for each call "
+                "to get_socket()"
+            )
+
+            self.assertEqual(
+                socks_for_gr1[0], socks_for_gr1[1],
+                "Expected greenlet 1 to get the same socket for each call "
+                "to get_socket()"
+            )
+
             if expect_success:
+                # We used the proper pool class, so start_request successfully
+                # distinguished between the two greenlets.
                 self.assertNotEqual(
-                    sock_ids[0], sock_ids[1],
+                    socks_for_gr0[0], socks_for_gr1[0],
                     "Expected two greenlets to get two different sockets"
                 )
+
             else:
+                # We used the wrong pool class, so start_request didn't
+                # distinguish between the two greenlets, and it gave them both
+                # the same socket.
                 self.assertEqual(
-                    sock_ids[0], sock_ids[1],
+                    socks_for_gr0[0], socks_for_gr1[0],
                     "Expected two greenlets to get same socket"
                 )
 

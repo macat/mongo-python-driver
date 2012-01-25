@@ -271,7 +271,7 @@ class Connection(common.BaseObject):
                                      "2.6 you must install the ssl package "
                                      "from PyPI.")
         if use_greenlets:
-            # TODO: make a greenlet_pool module
+            import greenlet_pool
             self.pool_class = greenlet_pool.GreenletPool
         else:
             self.pool_class = pool.Pool

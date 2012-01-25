@@ -117,7 +117,6 @@ class Pool(object):
             return sock, True
 
         # We're not in a request, just get any free socket or create one
-        sock, from_pool = None, None
         try:
             sock, from_pool = self.sockets.pop(), True
         except KeyError:
