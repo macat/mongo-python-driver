@@ -260,7 +260,12 @@ class Connection(common.BaseObject):
                                      "are using a python version previous to "
                                      "2.6 you must install the ssl package "
                                      "from PyPI.")
-        self.pool_class = pool.Pool
+        if use_greenlets:
+            import greenlet_pool
+            self.pool_class = greenlet_pool.GreenletPool
+        else:
+            self.pool_class = pool.Pool
+
         self.__pool = self.pool_class(
             None,
             self.__max_pool_size,
