@@ -20,3 +20,8 @@ def delay(sec):
         var d = new Date((new Date()).getTime() + %s * 1000);
         while (d > (new Date())) { }; return true;
     }''' % sec
+
+def server_started_with_auth(connection):
+    command_line = connection.admin.command('getCmdLineOpts')
+    assert command_line['ok'] == 1, "getCmdLineOpts() failed"
+    return '--auth'  in command_line['argv']
