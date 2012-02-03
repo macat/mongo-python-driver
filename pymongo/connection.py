@@ -61,12 +61,6 @@ if sys.platform.startswith('java'):
 else:
     from select import select
 
-have_ssl = True
-try:
-    import ssl
-except ImportError:
-    have_ssl = False
-
 def _closed(sock):
     """Return True if we know socket has been closed, False otherwise.
     """
@@ -265,7 +259,7 @@ class Connection(common.BaseObject):
                               options.get('sockettimeoutms'))
         self.__conn_timeout = options.get('connecttimeoutms')
         self.__use_ssl = options.get('ssl', False)
-        if self.__use_ssl and not have_ssl:
+        if self.__use_ssl and not pool.have_ssl:
             raise ConfigurationError("The ssl module is not available. If you "
                                      "are using a python version previous to "
                                      "2.6 you must install the ssl package "

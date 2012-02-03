@@ -18,6 +18,7 @@ import threading
 
 from pymongo.errors import ConnectionFailure
 
+
 have_ssl = True
 try:
     import ssl
