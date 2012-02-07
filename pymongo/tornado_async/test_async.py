@@ -56,7 +56,7 @@ def delay(ms):
     """ % ms
 
 
-class AsyncTest(
+class TornadoTest(
     puritanical.PuritanicalTest,
     eventually.AssertEventuallyTest
 ):
@@ -81,7 +81,7 @@ class AsyncTest(
         return output.get('cursors', {}).get('totalOpen')
 
     def async_connection(self):
-        cx = async.AsyncConnection()
+        cx = async.TornadoConnection()
         loop = tornado.ioloop.IOLoop.instance()
 
         def connected(connection, error):
@@ -124,20 +124,20 @@ class AsyncTest(
             )
         )
 
-        super(AsyncTest, self).tearDown()
+        super(TornadoTest, self).tearDown()
 
 
-class AsyncTestBasic(AsyncTest):
+class TornadoTestBasic(TornadoTest):
     def test_repr(self):
         cx = self.async_connection()
-        self.assert_(repr(cx).startswith('AsyncConnection'))
+        self.assert_(repr(cx).startswith('TornadoConnection'))
         db = cx.test
-        self.assert_(repr(db).startswith('AsyncDatabase'))
+        self.assert_(repr(db).startswith('TornadoDatabase'))
         coll = db.test
-        self.assert_(repr(coll).startswith('AsyncCollection'))
+        self.assert_(repr(coll).startswith('TornadoCollection'))
 
     def test_connection(self):
-        cx = async.AsyncConnection()
+        cx = async.TornadoConnection()
 
         # Can't access databases before connecting
         self.assertRaises(
@@ -172,7 +172,7 @@ class AsyncTestBasic(AsyncTest):
         tornado.ioloop.IOLoop.instance().start()
 
     def test_connection_callback(self):
-        cx = async.AsyncConnection()
+        cx = async.TornadoConnection()
         self.check_callback_handling(cx.open)
         
     def test_cursor(self):
@@ -180,7 +180,7 @@ class AsyncTestBasic(AsyncTest):
         coll = cx.test.foo
         # We're not actually running the find(), so null callback is ok
         cursor = coll.find(callback=lambda: None)
-        self.assert_(isinstance(cursor, async.AsyncCursor))
+        self.assert_(isinstance(cursor, async.TornadoCursor))
         self.assert_(cursor.started_async, "Cursor should start immediately")
 
     def test_find(self):
@@ -247,7 +247,7 @@ class AsyncTestBasic(AsyncTest):
                 batch_size=75 # results in 3 batches since there are 200 docs
             )
 
-        async.AsyncConnection().open(callback=connected)
+        async.TornadoConnection().open(callback=connected)
 
         self.assertEventuallyEqual(
             [
@@ -403,7 +403,7 @@ class AsyncTestBasic(AsyncTest):
     def test_find_is_async(self):
         """
         Confirm find() is async by launching three operations which will finish
-        out of order. Also test that AsyncConnection doesn't reuse sockets
+        out of order. Also test that TornadoConnection doesn't reuse sockets
         incorrectly.
         """
         # Make a big unindexed collection that will take a long time to query
@@ -552,7 +552,7 @@ class AsyncTestBasic(AsyncTest):
         2. In the find() callback, start closing the cursor
         3. Wait a little to make sure the cursor closes
         4. Stop the IOLoop so we can exit test_cursor_close()
-        5. In AsyncTest.tearDown(), we'll assert all cursors have closed.
+        5. In TornadoTest.tearDown(), we'll assert all cursors have closed.
         """
         cx = self.async_connection()
         loop = tornado.ioloop.IOLoop.instance()
@@ -991,7 +991,7 @@ class AsyncTestBasic(AsyncTest):
 
     def test_nested_callbacks_2(self):
         loop = tornado.ioloop.IOLoop.instance()
-        cx = async.AsyncConnection()
+        cx = async.TornadoConnection()
         results = []
 
         def connected(cx, error):
@@ -1025,7 +1025,7 @@ class AsyncTestBasic(AsyncTest):
         loop.start()
 
 
-class AsyncSSLTest(AsyncTest):
+class TornadoSSLTest(TornadoTest):
     def test_no_ssl(self):
         if have_ssl:
             raise SkipTest(
@@ -1034,7 +1034,7 @@ class AsyncSSLTest(AsyncTest):
             )
 
         self.assertRaises(ConfigurationError,
-            async.AsyncConnection, ssl=True)
+            async.TornadoConnection, ssl=True)
 #        self.assertRaises(ConfigurationError,
 #            ReplicaSetConnection, ssl=True)
 
@@ -1046,7 +1046,7 @@ class AsyncSSLTest(AsyncTest):
             raise SkipTest()
 
         loop = tornado.ioloop.IOLoop.instance()
-        cx = async.AsyncConnection(connectTimeoutMS=100, ssl=True)
+        cx = async.TornadoConnection(connectTimeoutMS=100, ssl=True)
 
         def connected(cx, error):
             if error:
@@ -1077,7 +1077,7 @@ class AsyncSSLTest(AsyncTest):
 # TODO: apply pymongo's whole suite to async
 # TODO: don't use the 'test' database, use something that will play nice w/
 #     Jenkins environment
-# TODO: test SSL, I don't think my call to ssl.wrap_socket() in AsyncSocket is
+# TODO: test SSL, I don't think my call to ssl.wrap_socket() in TornadoSocket is
 #     right
 # TODO: check that sockets are returned to pool, or closed, or something
 # TODO: test unsafe remove

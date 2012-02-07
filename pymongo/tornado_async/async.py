@@ -44,7 +44,7 @@ def check_callable(kallable, required=False):
     if kallable is not None and not callable(kallable):
         raise TypeError("callback must be callable")
 
-class AsyncSocket(object):
+class TornadoSocket(object):
     """
     Replace socket with a class that yields from the current greenlet, if we're
     on a child greenlet, when making blocking calls, and uses Tornado IOLoop to
@@ -138,8 +138,8 @@ class AsyncSocket(object):
     def __del__(self):
         self.close()
 
-class AsyncPool(object):
-    """A simple connection pool of AsyncSockets.
+class TornadoPool(object):
+    """A simple connection pool of TornadoSockets.
     """
 
     def __init__(self, max_size, net_timeout, conn_timeout, use_ssl):
@@ -167,22 +167,22 @@ class AsyncPool(object):
             s = socket.socket(socket.AF_INET6)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        async_sock = AsyncSocket(s)
+        tornado_sock = TornadoSocket(s)
 
-        # AsyncSocket will pause the current greenlet and resume it when
+        # TornadoSocket will pause the current greenlet and resume it when
         # connection has completed
-        async_sock.connect((host, port))
+        tornado_sock.connect((host, port))
 
         if self.use_ssl:
             try:
                 # TODO: ugly, probably wrong
-                async_sock.socket = ssl.wrap_socket(async_sock.socket)
+                tornado_sock.socket = ssl.wrap_socket(tornado_sock.socket)
             except ssl.SSLError:
-                async_sock.close()
+                tornado_sock.close()
                 raise ConnectionFailure("SSL handshake failed. MongoDB may "
                                         "not be configured with SSL support.")
 
-        return async_sock
+        return tornado_sock
 
     def get_socket(self, host, port):
         # Unlike pymongo.Pool's get_socket(), we give out a socket here to
@@ -234,7 +234,7 @@ class AsyncPool(object):
         else:
             print >> sys.stderr, "return_socket() called on", gr, "without associated socket"
 
-class AsyncConnection(object):
+class TornadoConnection(object):
     def __init__(self, *args, **kwargs):
         # Store args and kwargs for when open() is called
         self.__init_args = args
@@ -257,13 +257,13 @@ class AsyncConnection(object):
             try:
                 cx = self.sync_connection = pymongo.Connection(
                     *self.__init_args,
-                    pool_class=AsyncPool,
+                    pool_class=TornadoPool,
                     **self.__init_kwargs
                 )
                 
-                # Replace the standard _Pool with an AsyncSocket-producing pool
+                # Replace the standard _Pool with an TornadoSocket-producing pool
                 # TODO: Don't require accessing private attributes
-                cx._Connection__pool = AsyncPool(
+                cx._Connection__pool = TornadoPool(
                     cx.max_pool_size,
                     cx._Connection__net_timeout,
                     cx._Connection__conn_timeout,
@@ -298,10 +298,10 @@ class AsyncConnection(object):
         """
         if not self.connected:
             raise InvalidOperation(
-                "Can't access database on AsyncConnection before calling"
+                "Can't access database on TornadoConnection before calling"
                 " connect()"
             )
-        return AsyncDatabase(self.sync_connection, name)
+        return TornadoDatabase(self.sync_connection, name)
     
     def __getitem__(self, name):
         """Get a database by name.
@@ -315,7 +315,7 @@ class AsyncConnection(object):
         return self.__getattr__(name)
     
     def __repr__(self):
-        return 'AsyncConnection(%s)' % (
+        return 'TornadoConnection(%s)' % (
             ','.join([
                 i for i in [
                     ','.join(self.__init_args),
@@ -324,12 +324,12 @@ class AsyncConnection(object):
             ])
         )
 
-class AsyncDatabase(pymongo.database.Database):
+class TornadoDatabase(pymongo.database.Database):
     def __getattr__(self, collection_name):
         """
         Return an async Collection instead of a pymongo Collection
         """
-        return AsyncCollection(self, collection_name)
+        return TornadoCollection(self, collection_name)
 
     def command(self, command, value=1,
                 check=True, allowable_errors=[],
@@ -377,9 +377,9 @@ class AsyncDatabase(pymongo.database.Database):
                               callback=command_callback)
  
     def __repr__(self):
-        return 'Async' + super(AsyncDatabase, self).__repr__()
+        return 'Tornado' + super(TornadoDatabase, self).__repr__()
 
-class AsyncCollection(pymongo.collection.Collection):
+class TornadoCollection(pymongo.collection.Collection):
     def __getattribute__(self, operation_name):
         """
         Override pymongo Collection's attributes to replace the basic CRUD
@@ -391,7 +391,7 @@ class AsyncCollection(pymongo.collection.Collection):
                                 asynchronously if provided a callback
         """
         # Get pymongo's synchronous method for this operation
-        super_obj = super(AsyncCollection, self)
+        super_obj = super(TornadoCollection, self)
         sync_method = super_obj.__getattribute__(operation_name)
 
         if operation_name not in ('update', 'insert', 'remove'):
@@ -408,10 +408,6 @@ class AsyncCollection(pymongo.collection.Collection):
                 kwargs['safe'] = bool(client_callback)
 
                 def call_method():
-                    assert greenlet.getcurrent().parent, (
-                        "Should be on child greenlet"
-                    )
-
                     result, error = None, None
                     try:
                         result = sync_method(*args, **kwargs)
@@ -461,7 +457,7 @@ class AsyncCollection(pymongo.collection.Collection):
 
     def find(self, *args, **kwargs):
         """
-        Run an async find(), and return an AsyncCursor, rather than returning a
+        Run an async find(), and return a TornadoCursor, rather than returning a
         pymongo Cursor for synchronous operations.
         """
         client_callback = kwargs.get('callback')
@@ -469,13 +465,13 @@ class AsyncCollection(pymongo.collection.Collection):
         kwargs = kwargs.copy()
         del kwargs['callback']
 
-        cursor = super(AsyncCollection, self).find(*args, **kwargs)
-        async_cursor = AsyncCursor(cursor)
-        async_cursor.get_more(client_callback)
+        cursor = super(TornadoCollection, self).find(*args, **kwargs)
+        tornado_cursor = TornadoCursor(cursor)
+        tornado_cursor.get_more(client_callback)
 
         # When the greenlet has sent the query on the socket, it will switch
         # back to the main greenlet, here, and we return to the caller.
-        return async_cursor
+        return tornado_cursor
 
     def find_one(self, *args, **kwargs):
         client_callback = kwargs.get('callback')
@@ -501,16 +497,16 @@ class AsyncCollection(pymongo.collection.Collection):
         self.find(*args, limit=-1, callback=find_one_callback, **kwargs)
 
     def __repr__(self):
-        return 'Async' + super(AsyncCollection, self).__repr__()
+        return 'Tornado' + super(TornadoCollection, self).__repr__()
 
 
-class AsyncCursor(object):
+class TornadoCursor(object):
     def __init__(self, cursor):
         """
         @param cursor:  Synchronous pymongo.Cursor
         """
         self.__sync_cursor = cursor
-        self.started_async = False
+        self.started = False
 
     def get_more(self, callback):
         """
@@ -520,9 +516,9 @@ class AsyncCursor(object):
         """
         check_callable(callback)
         assert not self.__sync_cursor._Cursor__killed
-        if self.started_async and not self.alive:
+        if self.started and not self.alive:
             raise InvalidOperation(
-                "Can't call get_more() on an AsyncCursor that has been"
+                "Can't call get_more() on an TornadoCursor that has been"
                 " exhausted or killed."
             )
 
@@ -530,7 +526,7 @@ class AsyncCursor(object):
             # This is executed on child greenlet
             result, error = None, None
             try:
-                self.started_async = True
+                self.started = True
                 self.__sync_cursor._refresh()
 
                 # TODO: Make this accessible w/o underscore hack
@@ -559,38 +555,3 @@ class AsyncCursor(object):
         """Explicitly close this cursor.
         """
         greenlet.greenlet(self.__sync_cursor.close).switch()
-
-    def __getattr__(self, name):
-        """
-        Support the chaining operators on cursors like limit() and batch_size()
-        """
-        # TODO: either implement chaining or delete this method
-        raise NotImplementedError(name)
-    
-        if name in (
-            'add_option', 'remove_option', 'limit', 'batch_size', 'skip',
-            'max_scan', 'sort', 'count', 'distinct', 'hint', 'where', 'explain'
-        ):
-            def op(*args, **kwargs):
-                if self.started_async:
-                    raise InvalidOperation(
-                        # TODO: better explanation, must pass callback in final
-                        # chaining operator
-                        "Can't call \"%s\" on a cursor once it's started"
-                    )
-
-                client_callback = kwargs.get('callback')
-                check_callable(client_callback)
-                if 'callback' in kwargs:
-                    kwargs = kwargs.copy()
-                    del kwargs['callback']
-
-                # Apply the chaining operator to the Cursor
-                getattr(self.__sync_cursor, name)(*args, **kwargs)
-
-                # Return the AsyncCursor
-                return self
-
-            return op
-        else:
-            raise AttributeError(name)
