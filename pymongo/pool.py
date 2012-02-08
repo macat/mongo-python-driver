@@ -130,9 +130,6 @@ class Pool(object):
         if sock:
             return sock, True
 
-        elif self.auto_start_request:
-            self.requests[request_key] = None
-
         # We're not in a request, just get any free socket or create one
         try:
             sock, from_pool = self.sockets.pop(), True

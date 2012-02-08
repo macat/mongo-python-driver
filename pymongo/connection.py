@@ -97,7 +97,8 @@ class Connection(common.BaseObject):
 
     def __init__(self, host=None, port=None, max_pool_size=10,
                  network_timeout=None, document_class=dict,
-                 tz_aware=False, use_greenlets=False, _connect=True, **kwargs):
+                 tz_aware=False, use_greenlets=False, _connect=True,
+                 _pool_class=None, **kwargs):
         """Create a new connection to a single MongoDB instance at *host:port*.
 
         The resultant connection object has connection-pooling built
@@ -263,11 +264,14 @@ class Connection(common.BaseObject):
                                      "are using a python version previous to "
                                      "2.6 you must install the ssl package "
                                      "from PyPI.")
-        if use_greenlets:
-            import greenlet_pool
-            self.pool_class = greenlet_pool.GreenletPool
+        if _pool_class:
+            self.pool_class = _pool_class
         else:
-            self.pool_class = pool.Pool
+            if use_greenlets:
+                import greenlet_pool
+                self.pool_class = greenlet_pool.GreenletPool
+            else:
+                self.pool_class = pool.Pool
 
         self.__pool = self.pool_class(
             None,

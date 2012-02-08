@@ -13,8 +13,10 @@
 # limitations under the License.
 
 """Tornado asynchronous Python driver for MongoDB."""
+import os
 
 import socket
+import sys
 
 have_ssl = True
 try:
@@ -24,17 +26,15 @@ except ImportError:
 
 import tornado.ioloop, tornado.iostream
 import greenlet
-import os
-import sys
 
-from bson.binary import UUID_SUBTYPE
+from bson.binary import OLD_UUID_SUBTYPE
 from bson.son import SON
 
 import pymongo
-from pymongo.errors import ConnectionFailure, InvalidOperation
-from pymongo import common, helpers
+from pymongo.errors import InvalidOperation
+from pymongo import helpers, greenlet_pool
 
-__all__ = ['AsyncConnection']
+__all__ = ['TornadoConnection']
 
 # TODO: sphinx-formatted docstrings
 
@@ -53,8 +53,9 @@ class TornadoSocket(object):
     We only implement those socket methods actually used by pymongo: connect,
     sendall, and recv.
     """
-    def __init__(self, sock):
+    def __init__(self, sock, use_ssl=False):
         self.socket = sock
+        self.use_ssl = use_ssl
         self._stream = None
 
     def setsockopt(self, *args, **kwargs):
@@ -74,12 +75,15 @@ class TornadoSocket(object):
         """A Tornado IOStream that wraps the actual socket"""
         if not self._stream:
             # Tornado's IOStream sets the socket to be non-blocking
-            self._stream = tornado.iostream.IOStream(self.socket)
+            if self.use_ssl:
+                self._stream = tornado.iostream.SSLIOStream(self.socket)
+            else:
+                self._stream = tornado.iostream.IOStream(self.socket)
         return self._stream
 
-    def connect(self, address):
+    def connect(self, pair):
         """
-        @param address: A tuple, (host, port)
+        @param pair: A tuple, (host, port)
         """
         child_gr = greenlet.getcurrent()
         assert child_gr.parent, "Should be on child greenlet"
@@ -89,7 +93,7 @@ class TornadoSocket(object):
         def connect_callback():
             child_gr.switch()
 
-        self.stream.connect(address, callback=connect_callback)
+        self.stream.connect(pair, callback=connect_callback)
 
         # Resume main greenlet
         child_gr.parent.switch()
@@ -138,101 +142,39 @@ class TornadoSocket(object):
     def __del__(self):
         self.close()
 
-class TornadoPool(object):
+
+class TornadoPool(greenlet_pool.GreenletPool):
     """A simple connection pool of TornadoSockets.
     """
-
-    def __init__(self, max_size, net_timeout, conn_timeout, use_ssl):
-        self.pid = os.getpid()
-        self.max_size = max_size
-
-        # TODO: how do connection- and net-timeouts work w/ non-blocking sockets?
-        self.net_timeout = net_timeout
-        self.conn_timeout = conn_timeout
-        self.use_ssl = use_ssl
-        self.sockets = []
-        self.greenlet2socket = {}
-
-    def connect(self, host, port):
-        """Connect to Mongo and return a new connected socket.
+    def connect(self, pair):
+        """Connect to Mongo and return a new connected TornadoSocket.
         """
         assert greenlet.getcurrent().parent, "Should be on child greenlet"
-        try:
-            # Prefer IPv4. If there is demand for an option
-            # to specify one or the other we can add it later.
-            s = socket.socket(socket.AF_INET)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except socket.gaierror:
-            # If that fails try IPv6
-            s = socket.socket(socket.AF_INET6)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._check_pair_arg(pair)
 
-        tornado_sock = TornadoSocket(s)
+        # Prefer IPv4. If there is demand for an option
+        # to specify one or the other we can add it later.
+        socket_types = (socket.AF_INET, socket.AF_INET6)
+        for socket_type in socket_types:
+            try:
+                s = socket.socket(socket_type)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(self.conn_timeout or 20.0)
+                break
+            except socket.gaierror:
+                # If that fails try IPv6
+                continue
+        else:
+            # None of the socket types worked
+            raise
+
+        tornado_sock = TornadoSocket(s, use_ssl=self.use_ssl)
 
         # TornadoSocket will pause the current greenlet and resume it when
         # connection has completed
-        tornado_sock.connect((host, port))
-
-        if self.use_ssl:
-            try:
-                # TODO: ugly, probably wrong
-                tornado_sock.socket = ssl.wrap_socket(tornado_sock.socket)
-            except ssl.SSLError:
-                tornado_sock.close()
-                raise ConnectionFailure("SSL handshake failed. MongoDB may "
-                                        "not be configured with SSL support.")
-
+        tornado_sock.connect(pair or self.pair)
         return tornado_sock
 
-    def get_socket(self, host, port):
-        # Unlike pymongo.Pool's get_socket(), we give out a socket here to
-        # which the caller has exclusive access until it closes the socket or
-        # calls return_socket().
-
-        # We use the pid here to avoid issues with fork / multiprocessing.
-        # See test.test_connection:TestConnection.test_fork for an example of
-        # what could go wrong otherwise
-
-        # TODO: comment above copied from official pymongo pool; does it apply
-        # to async? If not, can we delete all pid-management?
-        pid = os.getpid()
-
-        if pid != self.pid:
-            # TODO: refactor this into a function, __reset(), that's called from
-            # init
-            self.sockets = []
-            self.greenlet2socket = {}
-            self.pid = pid
-
-        try:
-            sock = (pid, self.sockets.pop())
-            print >> sys.stderr, 'reusing', sock, 'on greenlet', greenlet.getcurrent()
-            self.greenlet2socket[greenlet.getcurrent()] = sock
-            return (sock[1], True)
-        except IndexError:
-            sock = (pid, self.connect(host, port))
-            self.greenlet2socket[greenlet.getcurrent()] = sock
-            return (sock[1], False)
-
-    def return_socket(self):
-        # TODO: what if a socket created in a parent process is returned here
-        # after a fork?
-        # TODO: also, what about multithreading PLUS greenlets? are we thread-
-        # safe here?
-        gr = greenlet.getcurrent()
-        assert gr.parent, "Should be on child greenlet?"
-
-        sock = self.greenlet2socket.get(gr)
-        if sock:
-            # There's a race condition here, but we deliberately
-            # ignore it.  It means that if the pool_size is 10 we
-            # might actually keep slightly more than that.
-            if len(self.sockets) < self.max_size:
-                self.sockets.append(sock)
-            else:
-                sock.close()
-        else:
-            print >> sys.stderr, "return_socket() called on", gr, "without associated socket"
 
 class TornadoConnection(object):
     def __init__(self, *args, **kwargs):
@@ -255,21 +197,12 @@ class TornadoConnection(object):
             # Run on child greenlet
             error = None
             try:
-                cx = self.sync_connection = pymongo.Connection(
+                self.sync_connection = pymongo.Connection(
                     *self.__init_args,
-                    pool_class=TornadoPool,
+                    _pool_class=TornadoPool,
                     **self.__init_kwargs
                 )
                 
-                # Replace the standard _Pool with an TornadoSocket-producing pool
-                # TODO: Don't require accessing private attributes
-                cx._Connection__pool = TornadoPool(
-                    cx.max_pool_size,
-                    cx._Connection__net_timeout,
-                    cx._Connection__conn_timeout,
-                    cx._Connection__use_ssl
-                )
-
                 self.connected = True
             except Exception, e:
                 error = e
@@ -318,8 +251,8 @@ class TornadoConnection(object):
         return 'TornadoConnection(%s)' % (
             ','.join([
                 i for i in [
-                    ','.join(self.__init_args),
-                    ','.join(self.__init_kwargs),
+                    ','.join([str(i) for i in self.__init_args]),
+                    ','.join(['%s=%s' for k, v in self.__init_kwargs.items()]),
                 ] if i
             ])
         )
@@ -333,9 +266,13 @@ class TornadoDatabase(pymongo.database.Database):
 
     def command(self, command, value=1,
                 check=True, allowable_errors=[],
-                uuid_subtype=UUID_SUBTYPE, callback=None, **kwargs):
+                uuid_subtype=OLD_UUID_SUBTYPE, **kwargs):
         # TODO: What semantics exactly shall we support with check and callback?
         #   Is check still necessary to support the pymongo API internally ... ?
+        if 'callback' in kwargs:
+            callback = kwargs['callback']
+            del kwargs['callback']
+
         if check and not callback:
             raise InvalidOperation("Must pass a callback if check is True")
 
@@ -549,9 +486,15 @@ class TornadoCursor(object):
     @property
     def alive(self):
         """Does this cursor have the potential to return more data?"""
-        return self.__sync_cursor.alive and self.__sync_cursor._Cursor__id
+        return bool(
+            self.__sync_cursor.alive and self.__sync_cursor._Cursor__id
+        )
 
     def close(self):
         """Explicitly close this cursor.
         """
         greenlet.greenlet(self.__sync_cursor.close).switch()
+
+    def __del__(self):
+        if self.alive:
+            self.close()

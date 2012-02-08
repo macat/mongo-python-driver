@@ -15,6 +15,7 @@
 """Test the Tornado asynchronous Python driver for MongoDB."""
 
 import functools
+import os
 import time
 import unittest
 
@@ -33,6 +34,8 @@ from pymongo.tornado_async import async
 from pymongo.errors import InvalidOperation, ConfigurationError, \
     ConnectionFailure
 
+from test.testutils import delay
+
 import tornado.ioloop
 
 # Tornado testing tools
@@ -40,20 +43,8 @@ from pymongo.tornado_async import eventually, puritanical
 
 # TODO: sphinx-compat?
 
-def delay(ms):
-    """
-    Create a delaying $where clause. Note that you can only have one of these
-    Javascript functions running on the server at a time, see SERVER-4258.
-    @param ms:  Time to delay, in milliseconds
-    @return:    A Javascript $where clause that delays for that time
-    """
-    return """
-        function() {
-            var d = new Date((new Date()).getTime() + %d);
-            while (d > (new Date())) { };
-            return true;
-        }
-    """ % ms
+host = os.environ.get("DB_IP", "localhost")
+port = int(os.environ.get("DB_PORT", 27017))
 
 
 class TornadoTest(
@@ -61,8 +52,14 @@ class TornadoTest(
     eventually.AssertEventuallyTest
 ):
     def setUp(self):
-        super(AsyncTest, self).setUp()
-        self.sync_cx = pymongo.Connection()
+        super(TornadoTest, self).setUp()
+
+        # Store a regular synchronous pymongo Connection for convenience while
+        # testing. Low timeouts so we don't hang a test because, say, Mongo
+        # isn't up or is hung by a long-running $where clause.
+        self.sync_cx = pymongo.Connection(
+            host, port, connectTimeoutMS=200, socketTimeoutMS=200
+        )
         self.sync_db = self.sync_cx.test
         self.sync_coll = self.sync_db.test_collection
 
@@ -81,7 +78,7 @@ class TornadoTest(
         return output.get('cursors', {}).get('totalOpen')
 
     def async_connection(self):
-        cx = async.TornadoConnection()
+        cx = async.TornadoConnection(host, port)
         loop = tornado.ioloop.IOLoop.instance()
 
         def connected(connection, error):
@@ -116,6 +113,17 @@ class TornadoTest(
         self.sync_coll.remove()
 
         actual_open_cursors = self.get_open_cursors()
+
+        if actual_open_cursors != self.open_cursors:
+            # Run the loop for a little bit: An unfortunately convoluted means of
+            # letting all cursors close themselves before we finish the test, so
+            # tearDown() doesn't complain about cursors left open.
+            loop = tornado.ioloop.IOLoop.instance()
+            loop.add_timeout(time.time() + 0.25, loop.stop)
+            loop.start()
+
+            actual_open_cursors = self.get_open_cursors()
+
         self.assertEqual(
             self.open_cursors,
             actual_open_cursors,
@@ -137,7 +145,7 @@ class TornadoTestBasic(TornadoTest):
         self.assert_(repr(coll).startswith('TornadoCollection'))
 
     def test_connection(self):
-        cx = async.TornadoConnection()
+        cx = async.TornadoConnection(host, port)
 
         # Can't access databases before connecting
         self.assertRaises(
@@ -153,9 +161,10 @@ class TornadoTestBasic(TornadoTest):
         called = {'callback': False}
 
         def callback(connection, error):
-            called['callback'] = True
             if error:
                 raise error
+
+            called['callback'] = True
 
         self.assertEventuallyEqual(
             True,
@@ -172,7 +181,7 @@ class TornadoTestBasic(TornadoTest):
         tornado.ioloop.IOLoop.instance().start()
 
     def test_connection_callback(self):
-        cx = async.TornadoConnection()
+        cx = async.TornadoConnection(host, port)
         self.check_callback_handling(cx.open)
         
     def test_cursor(self):
@@ -181,7 +190,7 @@ class TornadoTestBasic(TornadoTest):
         # We're not actually running the find(), so null callback is ok
         cursor = coll.find(callback=lambda: None)
         self.assert_(isinstance(cursor, async.TornadoCursor))
-        self.assert_(cursor.started_async, "Cursor should start immediately")
+        self.assert_(cursor.started, "Cursor should start immediately")
 
     def test_find(self):
         results = []
@@ -247,7 +256,7 @@ class TornadoTestBasic(TornadoTest):
                 batch_size=75 # results in 3 batches since there are 200 docs
             )
 
-        async.TornadoConnection().open(callback=connected)
+        async.TornadoConnection(host, port).open(callback=connected)
 
         self.assertEventuallyEqual(
             [
@@ -264,7 +273,7 @@ class TornadoTestBasic(TornadoTest):
         self.check_callback_handling(
             cx.test.test_collection.find, required=True
         )
-        
+
     def test_find_default_batch(self):
         results = []
         cursor = None
@@ -332,74 +341,6 @@ class TornadoTestBasic(TornadoTest):
 
         tornado.ioloop.IOLoop.instance().start()
 
-    def __disabled__test_chaining(self):
-        """
-        Test chaining operations. The idea is to support an API like:
-            db.test.find().batch_size(5).limit(10, callback=my_callback)
-        ... where callback must be an argument to the *last* chained operator,
-        triggering the cursor to actually launch the operation. But at the
-        moment I'm abandoning this idea and requiring you to pass in batch_size,
-        limit, etc. as keyword arguments to find() along with the callback, and
-        I'm saying you can't do chaining with async.
-        """
-        results = []
-        def callback(result, error):
-            if error:
-                raise error
-            self.assert_(error is None, str(error))
-            results.append(result)
-
-        test_collection = self.async_connection().test.test_collection
-
-        for opname, params in [
-            ('limit', (5, )),
-            ('batch_size', (5, )),
-            ('add_option', (5, )),
-            ('remove_option', (5, )),
-            ('skip', (5, )),
-            ('max_scan', (5, )),
-            ('sort', ('foo', )),
-            ('sort', ('foo', 1)),
-            ('sort', ([('foo', 1)], )),
-            ('count', ()),
-            ('distinct', ()),
-            ('explain', ()),
-            ('hint', ('index_name',)),
-            ('where', ('where_clause', )),
-        ]:
-            cursor_with_callback = test_collection.find(
-                {'_id': 1},
-                callback=callback
-            )
-
-            # Can't call limit(), batch_size(), etc. on a cursor that already
-            # has a callback set. Callback must be the last option set on a
-            # cursor.
-            self.assertRaises(
-                pymongo.errors.InvalidOperation,
-                lambda: getattr(cursor_with_callback, opname)(*params)
-            )
-
-        self.assertEventuallyEqual(
-            [{'_id': 1, 's': hex(1)}],
-            lambda: results[0]
-        )
-
-        tornado.ioloop.IOLoop.instance().start()
-
-        results = []
-        cursor = test_collection.find().limit(5).sort('foo', pymongo.ASCENDING)
-        cursor.batch_size(5, callback=callback)
-
-        expected_results = [
-            [{'_id': i, 's': hex(i)}]
-            for j in range(2) for i in range(5 * j, 5 * (j+1))
-        ]
-
-        self.assertEventuallyEqual(expected_results, lambda: results[0])
-
-        tornado.ioloop.IOLoop.instance().start()
-
     def test_find_is_async(self):
         """
         Confirm find() is async by launching three operations which will finish
@@ -432,7 +373,7 @@ class TornadoTestBasic(TornadoTest):
         loop.add_timeout(
             now + 0.1,
             lambda: cx.test.test_collection.find(
-                {'_id': 1, '$where': delay(1000)},
+                {'_id': 1, '$where': delay(1)},
                 fields={'s': True, '_id': False},
                 callback=callback
             )
@@ -520,7 +461,7 @@ class TornadoTestBasic(TornadoTest):
         loop.add_timeout(
             time.time() + 0.1,
             lambda: cx.test.test_collection.find_one(
-                {'_id': 1, '$where': delay(500)},
+                {'_id': 1, '$where': delay(1)},
                 fields={'s': True, '_id': False},
                 callback=callback
             )
@@ -991,7 +932,7 @@ class TornadoTestBasic(TornadoTest):
 
     def test_nested_callbacks_2(self):
         loop = tornado.ioloop.IOLoop.instance()
-        cx = async.TornadoConnection()
+        cx = async.TornadoConnection(host, port)
         results = []
 
         def connected(cx, error):
@@ -1034,7 +975,7 @@ class TornadoSSLTest(TornadoTest):
             )
 
         self.assertRaises(ConfigurationError,
-            async.TornadoConnection, ssl=True)
+            async.TornadoConnection, host, port, ssl=True)
 #        self.assertRaises(ConfigurationError,
 #            ReplicaSetConnection, ssl=True)
 
@@ -1046,7 +987,7 @@ class TornadoSSLTest(TornadoTest):
             raise SkipTest()
 
         loop = tornado.ioloop.IOLoop.instance()
-        cx = async.TornadoConnection(connectTimeoutMS=100, ssl=True)
+        cx = async.TornadoConnection(host, port, connectTimeoutMS=100, ssl=True)
 
         def connected(cx, error):
             if error:
