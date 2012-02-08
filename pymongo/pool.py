@@ -86,7 +86,7 @@ class Pool(object):
                 s = socket.socket(socket_type)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.settimeout(self.conn_timeout or 20.0)
-                s.connect(self.pair or pair)
+                s.connect(pair or self.pair)
                 break
             except socket.gaierror:
                 # If that fails try IPv6
@@ -129,6 +129,9 @@ class Pool(object):
         sock = self.requests.get(request_key)
         if sock:
             return sock, True
+
+        elif self.auto_start_request:
+            self.requests[request_key] = None
 
         # We're not in a request, just get any free socket or create one
         try:

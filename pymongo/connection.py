@@ -97,7 +97,7 @@ class Connection(common.BaseObject):
 
     def __init__(self, host=None, port=None, max_pool_size=10,
                  network_timeout=None, document_class=dict,
-                 tz_aware=False, _connect=True, **kwargs):
+                 tz_aware=False, use_greenlets=False, _connect=True, **kwargs):
         """Create a new connection to a single MongoDB instance at *host:port*.
 
         The resultant connection object has connection-pooling built
@@ -170,6 +170,9 @@ class Connection(common.BaseObject):
             See :class:`~pymongo.ReadPreference` for available options.
           - `slave_okay` or `slaveOk` (deprecated): Use `read_preference`
             instead.
+          - `use_greenlets` (optional): if ``True``, :meth:`start_request()`
+            will ensure that the current greenlet uses the same socket for all
+            requests until :meth:`end_request()`
 
         .. seealso:: :meth:`end_request`
         .. versionchanged:: 2.1
@@ -861,8 +864,8 @@ class Connection(common.BaseObject):
                 self.__pool.return_socket(sock)
 
     def start_request(self):
-        """Ensure the current thread or greenlet always uses the same socket
-           until it calls end_request().
+        """Assigns a socket to the current thread or greenlet until it calls
+        :meth:`end_request`
 
            In Python 2.6 and above, or in Python 2.5 with
            "from __future__ import with_statement", start_request() can be used

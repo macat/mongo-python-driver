@@ -23,4 +23,4 @@ import pool
 class GreenletPool(pool.Pool):
     def _request_key(self):
         super_key = pool.Pool._request_key(self)
-        return (super_key, greenlet.getcurrent())
+        return (super_key, id(greenlet.getcurrent()))
